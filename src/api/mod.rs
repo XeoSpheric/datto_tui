@@ -4,7 +4,7 @@ use crate::config::Config;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use std::time::Duration;
-use types::{SitesResponse, TokenResponse};
+use types::{DevicesResponse, SitesResponse, TokenResponse};
 
 #[derive(Clone, Debug)]
 pub struct RmmClient {
@@ -97,5 +97,46 @@ impl RmmClient {
             .await
             .context("Failed to parse JSON")?;
         Ok(sites_response)
+    }
+
+    pub async fn get_devices(
+        &self,
+        site_uid: &str,
+        page: i32,
+        max: i32,
+    ) -> Result<DevicesResponse> {
+        let access_token = self.access_token.as_ref().context("Not authenticated")?;
+
+        let url = format!(
+            "{}/api/v2/site/{}/devices?page={}&max={}",
+            self.config.api_url, site_uid, page, max
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(access_token)
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .context("Failed to send request")?;
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("API request failed with status: {} - {}", status, text);
+        }
+
+        let text = response
+            .text()
+            .await
+            .context("Failed to get response text")?;
+
+        // Debug: Write response to file
+        let _ = std::fs::write("api_devices_response.json", &text);
+
+        let devices_response = serde_json::from_str(&text).context("Failed to parse JSON")?;
+        Ok(devices_response)
     }
 }

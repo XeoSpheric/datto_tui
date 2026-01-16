@@ -11,7 +11,7 @@ pub struct TokenResponse {
 #[serde(rename_all = "camelCase")]
 pub struct PageDetails {
     pub count: i32,
-    pub total_count: i32,
+    pub total_count: Option<i32>,
     pub prev_page_url: Option<String>,
     pub next_page_url: Option<String>,
 }
@@ -50,6 +50,26 @@ pub struct Site {
     pub autotask_company_name: Option<String>,
     pub autotask_company_id: Option<String>,
     pub portal_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Device {
+    pub uid: String,
+    pub hostname: String,
+    pub description: Option<String>,
+    pub online: bool,
+    #[serde(rename = "lastSeen")]
+    pub last_seen: Option<i64>,
+    #[serde(rename = "operatingSystem")]
+    pub operating_system: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DevicesResponse {
+    pub page_details: PageDetails,
+    pub devices: Vec<Device>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

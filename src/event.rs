@@ -10,6 +10,7 @@ pub enum Event {
     Mouse(crossterm::event::MouseEvent),
     Resize(u16, u16),
     SitesFetched(Result<crate::api::types::SitesResponse, String>),
+    DevicesFetched(Result<crate::api::types::DevicesResponse, String>),
 }
 
 #[derive(Debug)]

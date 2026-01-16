@@ -1,5 +1,5 @@
 use crate::api::RmmClient;
-use crate::api::types::Site;
+use crate::api::types::{Device, Site};
 use crate::event::{Event, EventHandler};
 use crate::tui::Tui;
 use crate::ui;
@@ -23,11 +23,17 @@ pub struct App {
     pub client: Option<RmmClient>,
     pub current_view: CurrentView,
 
-    // Navigation & Pagination
+    // Navigation & Pagination (Sites)
     pub table_state: TableState,
     pub current_page: i32,
     pub total_pages: i32,
     pub total_count: i32,
+
+    // Devices
+    pub devices: Vec<Device>,
+    pub devices_loading: bool,
+    pub devices_error: Option<String>,
+    pub devices_table_state: TableState,
 }
 
 impl Default for App {
@@ -45,6 +51,11 @@ impl Default for App {
             current_page: 0,
             total_pages: 0,
             total_count: 0,
+
+            devices: Vec::new(),
+            devices_loading: false,
+            devices_error: None,
+            devices_table_state: TableState::default(),
         }
     }
 }
@@ -85,7 +96,7 @@ impl App {
                             self.sites = response.sites;
 
                             // Update pagination info
-                            self.total_count = response.page_details.total_count;
+                            self.total_count = response.page_details.total_count.unwrap_or(0);
                             // Calculate total pages (assuming max=50)
                             if self.total_count > 0 {
                                 self.total_pages = (self.total_count as f64 / 50.0).ceil() as i32;
@@ -101,6 +112,22 @@ impl App {
                         }
                         Err(e) => {
                             self.error = Some(e.to_string());
+                        }
+                    }
+                }
+                Event::DevicesFetched(result) => {
+                    self.devices_loading = false;
+                    match result {
+                        Ok(response) => {
+                            self.devices = response.devices;
+                            if !self.devices.is_empty() {
+                                self.devices_table_state.select(Some(0));
+                            } else {
+                                self.devices_table_state.select(None);
+                            }
+                        }
+                        Err(e) => {
+                            self.devices_error = Some(e.to_string());
                         }
                     }
                 }
@@ -125,6 +152,23 @@ impl App {
         }
     }
 
+    fn fetch_devices(&mut self, site_uid: String, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(client) = &self.client {
+            self.devices_loading = true;
+            self.devices_error = None;
+            self.devices = Vec::new(); // Clear previous
+            let client = client.clone();
+            tokio::spawn(async move {
+                // Fetch first page of devices for now
+                let result = client
+                    .get_devices(&site_uid, 0, 50)
+                    .await
+                    .map_err(|e| format!("{:#}", e));
+                tx.send(Event::DevicesFetched(result)).unwrap();
+            });
+        }
+    }
+
     fn handle_key_event(&mut self, key: KeyEvent, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
         match self.current_view {
             CurrentView::List => match key.code {
@@ -134,8 +178,11 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Right => self.next_page(tx),
                 KeyCode::Char('p') | KeyCode::Left => self.prev_page(tx),
                 KeyCode::Enter => {
-                    if self.table_state.selected().is_some() {
-                        self.current_view = CurrentView::Detail;
+                    if let Some(idx) = self.table_state.selected() {
+                        if let Some(site) = self.sites.get(idx) {
+                            self.current_view = CurrentView::Detail;
+                            self.fetch_devices(site.uid.clone(), tx);
+                        }
                     }
                 }
                 _ => {}
@@ -144,6 +191,8 @@ impl App {
                 KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Char('q') => {
                     self.current_view = CurrentView::List;
                 }
+                KeyCode::Char('j') | KeyCode::Down => self.next_device(),
+                KeyCode::Char('k') | KeyCode::Up => self.prev_device(),
                 _ => {}
             },
         }
@@ -178,9 +227,6 @@ impl App {
     }
 
     fn next_page(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
-        // total_pages is 1-based count, current_page is 0-based index.
-        // If total_pages = 1, current_page max is 0.
-        // If current_page + 1 < total_pages, we can go next.
         if self.current_page + 1 < self.total_pages {
             self.current_page += 1;
             self.fetch_sites(tx);
@@ -192,5 +238,33 @@ impl App {
             self.current_page -= 1;
             self.fetch_sites(tx);
         }
+    }
+
+    fn next_device(&mut self) {
+        let i = match self.devices_table_state.selected() {
+            Some(i) => {
+                if i >= self.devices.len().saturating_sub(1) {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.devices_table_state.select(Some(i));
+    }
+
+    fn prev_device(&mut self) {
+        let i = match self.devices_table_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.devices.len().saturating_sub(1)
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.devices_table_state.select(Some(i));
     }
 }
