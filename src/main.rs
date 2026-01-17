@@ -7,6 +7,7 @@ pub mod ui;
 
 use anyhow::Result;
 use api::datto::DattoClient;
+use api::sophos::SophosClient;
 use app::App;
 use config::Config;
 use event::EventHandler;
@@ -23,6 +24,7 @@ async fn main() -> Result<()> {
     // Initialize API Client
     let mut client = DattoClient::new(config.datto).expect("Failed to create API client");
     let rocket_client = crate::api::rocket_cyber::RocketCyberClient::new(config.rocket).ok(); // Create Rocket client
+    let sophos_client = SophosClient::new(config.sophos).ok(); // Create Sophos client
 
     // Authenticate
     if let Err(e) = client.authenticate().await {
@@ -35,7 +37,7 @@ async fn main() -> Result<()> {
 
     // Create app and event handler including tick rate
     // Create app and event handler including tick rate
-    let mut app = App::new(Some(client), rocket_client);
+    let mut app = App::new(Some(client), rocket_client, sophos_client);
 
     let tick_rate = Duration::from_millis(250);
     let mut events = EventHandler::new(tick_rate);

@@ -26,6 +26,7 @@ pub enum Event {
         Result<crate::api::datto::types::SiteVariable, String>,
     ),
     SiteUpdated(Result<crate::api::datto::types::Site, String>),
+    SophosCasesFetched(String, Result<Vec<crate::api::sophos::Case>, String>),
 }
 
 #[derive(Debug)]

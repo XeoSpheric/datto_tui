@@ -1,6 +1,6 @@
 [package]
-name = "datto_tui"
-version = "0.1.0"
+name = "kyber_tui"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]

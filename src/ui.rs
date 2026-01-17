@@ -1,4 +1,4 @@
-use crate::app::{App, CurrentView, InputField, InputMode, SiteDetailTab, SiteEditField};
+use crate::app::{App, CurrentView, InputField, InputMode, SiteDetailTab};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap},
@@ -14,14 +14,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     let status_text = match app.current_view {
         CurrentView::List => {
             format!(
-                "Datto TUI | Sites: {} | Page {}/{} | 'q': quit, 'r': reload, 'j/k': move, 'n/p': page, 'Enter': details",
-                app.total_count,
-                app.current_page + 1,
-                if app.total_pages == 0 {
-                    1
-                } else {
-                    app.total_pages
-                }
+                "Kyber TUI | Sites: {} | 'q': quit, 'r': reload, 'j/k': move, 'Enter': details",
+                app.total_count
             )
         }
         CurrentView::Detail => "Detail View | 'Esc'/'q': back".to_string(),
@@ -280,7 +274,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     )
     .header(Row::new(vec!["Setting", "Value"]).style(Style::default().add_modifier(Modifier::BOLD)))
     .block(block)
-    .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
     .highlight_symbol(">> ");
 
     frame.render_stateful_widget(table, area, &mut app.settings_table_state);

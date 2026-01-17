@@ -325,21 +325,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "datto_tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "dotenvy",
- "futures",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1017,6 +1002,21 @@ dependencies = [
  "hashbrown",
  "portable-atomic",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "kyber_tui"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "dotenvy",
+ "futures",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -1,7 +1,10 @@
 use crate::api::datto::DattoClient;
+use crate::api::datto::devices::DevicesApi;
+use crate::api::datto::sites::SitesApi;
 use crate::api::datto::types::{
     CreateVariableRequest, Device, Site, UpdateSiteRequest, UpdateVariableRequest,
 };
+use crate::api::datto::variables::VariablesApi;
 use crate::event::{Event, EventHandler};
 use crate::tui::Tui;
 use crate::ui;
@@ -10,6 +13,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::TableState;
 
 use crate::api::rocket_cyber::RocketCyberClient;
+use crate::api::rocket_cyber::incidents::IncidentsApi;
+use crate::api::sophos::SophosClient;
 use std::collections::HashMap;
 
 #[derive(Debug, Default, Clone)]
@@ -119,7 +124,8 @@ pub struct App {
     pub is_loading: bool,
     pub error: Option<String>,
     pub client: Option<DattoClient>,
-    pub rocket_client: Option<RocketCyberClient>, // Add field
+    pub rocket_client: Option<RocketCyberClient>,
+    pub sophos_client: Option<SophosClient>,
     pub current_view: CurrentView,
 
     // Navigation & Pagination (Sites)
@@ -155,7 +161,8 @@ impl Default for App {
             is_loading: false,
             error: None,
             client: None,
-            rocket_client: None, // Initialize
+            rocket_client: None,
+            sophos_client: None,
             current_view: CurrentView::List,
 
             table_state: TableState::default(),
@@ -177,10 +184,15 @@ impl Default for App {
 }
 
 impl App {
-    pub fn new(client: Option<DattoClient>, rocket_client: Option<RocketCyberClient>) -> Self {
+    pub fn new(
+        client: Option<DattoClient>,
+        rocket_client: Option<RocketCyberClient>,
+        sophos_client: Option<SophosClient>,
+    ) -> Self {
         let mut app = Self::default();
         app.client = client;
         app.rocket_client = rocket_client;
+        app.sophos_client = sophos_client;
         app
     }
 
@@ -195,6 +207,13 @@ impl App {
         // Fetch incidents
         if self.rocket_client.is_some() {
             self.fetch_rocket_incidents(events.sender());
+        }
+
+        // Authenticate Sophos if present
+        if let Some(client) = &mut self.sophos_client {
+            if let Err(e) = client.authenticate().await {
+                self.error = Some(format!("Sophos Auth Failed: {}", e));
+            }
         }
 
         while !self.should_quit {
@@ -304,7 +323,22 @@ impl App {
                 Event::SiteVariablesFetched(site_uid, result) => match result {
                     Ok(variables) => {
                         if let Some(site) = self.sites.iter_mut().find(|s| s.uid == site_uid) {
-                            site.variables = Some(variables);
+                            site.variables = Some(variables.clone());
+
+                            // Check for Sophos MDR
+                            for var in &variables {
+                                if var.name == "tuiMdrProvider" && var.value == "Sophos" {
+                                    // Find tuiMdrId
+                                    if let Some(id_var) =
+                                        variables.iter().find(|v| v.name == "tuiMdrId")
+                                    {
+                                        self.fetch_sophos_cases(
+                                            id_var.value.clone(),
+                                            events.sender(),
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(_e) => {
@@ -366,6 +400,35 @@ impl App {
                         Err(e) => self.error = Some(e),
                     }
                 }
+                Event::SophosCasesFetched(tenant_id, result) => match result {
+                    Ok(cases) => {
+                        // Update stats
+                        let entry = self
+                            .incident_stats
+                            .entry(tenant_id.clone())
+                            .or_insert(IncidentStats::default());
+
+                        // Reset or accumulate? Probably reset for this tenant as it's a fresh fetch
+                        entry.active = 0;
+                        entry.resolved = 0;
+
+                        for case in cases {
+                            let status = case.status.as_deref().unwrap_or("").to_lowercase();
+                            if status == "resolved" || status == "closed" {
+                                // Assuming closed is also resolved
+                                entry.resolved += 1;
+                            } else {
+                                entry.active += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.error = Some(format!(
+                            "Failed to fetch Sophos cases for {}: {}",
+                            tenant_id, e
+                        ));
+                    }
+                },
             }
         }
         Ok(())
@@ -427,6 +490,26 @@ impl App {
                     .await
                     .map_err(|e| e.to_string());
                 tx.send(Event::SiteVariablesFetched(site_uid, result))
+                    .unwrap();
+            });
+        }
+    }
+
+    fn fetch_sophos_cases(&self, tenant_id: String, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(client) = &self.sophos_client {
+            let client = client.clone();
+            let t_id = tenant_id.clone();
+            tokio::spawn(async move {
+                // First get tenant to find data region
+                let cases_result = async {
+                    let tenant = client.get_tenant(&t_id).await?;
+                    let cases = client.get_cases(&t_id, &tenant.data_region).await?;
+                    Ok(cases)
+                }
+                .await
+                .map_err(|e: anyhow::Error| e.to_string());
+
+                tx.send(Event::SophosCasesFetched(tenant_id, cases_result))
                     .unwrap();
             });
         }
@@ -514,8 +597,6 @@ impl App {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Char('j') | KeyCode::Down => self.next_row(),
                 KeyCode::Char('k') | KeyCode::Up => self.previous_row(),
-                KeyCode::Char('n') | KeyCode::Right => self.next_page(tx),
-                KeyCode::Char('p') | KeyCode::Left => self.prev_page(tx),
                 KeyCode::Char('r') => {
                     self.fetch_sites(tx);
                 }
@@ -811,20 +892,6 @@ impl App {
             None => 0,
         };
         self.table_state.select(Some(i));
-    }
-
-    fn next_page(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
-        if self.current_page + 1 < self.total_pages {
-            self.current_page += 1;
-            self.fetch_sites(tx);
-        }
-    }
-
-    fn prev_page(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
-        if self.current_page > 0 {
-            self.current_page -= 1;
-            self.fetch_sites(tx);
-        }
     }
 
     fn next_device(&mut self) {
