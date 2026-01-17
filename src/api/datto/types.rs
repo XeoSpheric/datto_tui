@@ -50,6 +50,55 @@ pub struct Site {
     pub autotask_company_name: Option<String>,
     pub autotask_company_id: Option<String>,
     pub portal_url: Option<String>,
+    #[serde(skip, default)]
+    pub variables: Option<Vec<SiteVariable>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteVariable {
+    pub id: i32,
+    pub name: String,
+    pub value: String,
+    pub masked: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteVariablesResponse {
+    pub page_details: PageDetails,
+    pub variables: Vec<SiteVariable>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateVariableRequest {
+    pub name: String,
+    pub value: String,
+    pub masked: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateVariableRequest {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSiteRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub notes: Option<String>,
+    pub on_demand: Option<bool>,
+    pub splashtop_auto_install: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchManagement {
+    pub patch_status: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -63,6 +112,7 @@ pub struct Device {
     pub last_seen: Option<i64>,
     #[serde(rename = "operatingSystem")]
     pub operating_system: Option<String>,
+    pub patch_management: Option<PatchManagement>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

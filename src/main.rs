@@ -6,7 +6,7 @@ pub mod tui;
 pub mod ui;
 
 use anyhow::Result;
-use api::RmmClient;
+use api::datto::DattoClient;
 use app::App;
 use config::Config;
 use event::EventHandler;
@@ -15,21 +15,18 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load config
-    let config = Config::from_env();
-    let mut client = match config {
-        Ok(cfg) => Some(RmmClient::new(cfg)?),
-        Err(e) => {
-            eprintln!("Warning: Failed to load config: {}", e);
-            None
-        }
-    };
+    let config = Config::from_env().unwrap_or_else(|e| {
+        eprintln!("Failed to load config: {}", e);
+        std::process::exit(1);
+    });
 
-    if let Some(ref mut c) = client {
-        if let Err(e) = c.authenticate().await {
-            eprintln!("Warning: Authentication failed: {}", e);
-            // We continue, but the app will likely fail to fetch data.
-            // The UI should ideally show this error, but for now we print to stderr before TUI init.
-        }
+    // Initialize API Client
+    let mut client = DattoClient::new(config.datto).expect("Failed to create API client");
+    let rocket_client = crate::api::rocket_cyber::RocketCyberClient::new(config.rocket).ok(); // Create Rocket client
+
+    // Authenticate
+    if let Err(e) = client.authenticate().await {
+        eprintln!("Warning: Authentication failed: {}", e);
     }
 
     // Setup terminal
@@ -37,7 +34,9 @@ async fn main() -> Result<()> {
     tui::install_panic_hook();
 
     // Create app and event handler including tick rate
-    let mut app = App::new(client);
+    // Create app and event handler including tick rate
+    let mut app = App::new(Some(client), rocket_client);
+
     let tick_rate = Duration::from_millis(250);
     let mut events = EventHandler::new(tick_rate);
 

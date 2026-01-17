@@ -1,5 +1,6 @@
+use crate::api::datto::types::{DevicesResponse, SitesResponse};
 use anyhow::Result;
-use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent};
+use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent, MouseEvent};
 use futures::{FutureExt, StreamExt};
 use tokio::sync::mpsc;
 
@@ -7,10 +8,24 @@ use tokio::sync::mpsc;
 pub enum Event {
     Tick,
     Key(KeyEvent),
-    Mouse(crossterm::event::MouseEvent),
+    Mouse(MouseEvent),
     Resize(u16, u16),
-    SitesFetched(Result<crate::api::types::SitesResponse, String>),
-    DevicesFetched(Result<crate::api::types::DevicesResponse, String>),
+    SitesFetched(Result<SitesResponse, String>),
+    DevicesFetched(Result<DevicesResponse, String>),
+    IncidentsFetched(Result<Vec<crate::api::rocket_cyber::types::Incident>, String>),
+    SiteVariablesFetched(
+        String,
+        Result<Vec<crate::api::datto::types::SiteVariable>, String>,
+    ), // (Site UID, Result)
+    VariableCreated(
+        String,
+        Result<crate::api::datto::types::SiteVariable, String>,
+    ),
+    VariableUpdated(
+        String,
+        Result<crate::api::datto::types::SiteVariable, String>,
+    ),
+    SiteUpdated(Result<crate::api::datto::types::Site, String>),
 }
 
 #[derive(Debug)]
