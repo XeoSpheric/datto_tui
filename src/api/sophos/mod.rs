@@ -195,6 +195,73 @@ impl SophosClient {
 
         Ok(response_json.items)
     }
+
+    pub async fn get_endpoints(
+        &self,
+        tenant_id: &str,
+        data_region: &str,
+        hostname_contains: &str,
+    ) -> Result<Vec<Endpoint>> {
+        let url = format!(
+            "https://api-{}.central.sophos.com/endpoint/v1/endpoints",
+            data_region
+        );
+        let token = self.access_token.as_ref().context("Not authenticated")?;
+
+        let params = [("hostnameContains", hostname_contains)];
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("X-Tenant-ID", tenant_id)
+            .query(&params)
+            .send()
+            .await
+            .context("Failed to send get_endpoints request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Get endpoints failed: {} - {}", status, text);
+        }
+
+        let response_json = response
+            .json::<EndpointsResponse>()
+            .await
+            .context("Failed to parse endpoints response")?;
+
+        Ok(response_json.items)
+    }
+    pub async fn start_scan(
+        &self,
+        tenant_id: &str,
+        data_region: &str,
+        endpoint_id: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "https://api-{}.central.sophos.com/endpoint/v1/endpoints/{}/scans",
+            data_region, endpoint_id
+        );
+        let token = self.access_token.as_ref().context("Not authenticated")?;
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("X-Tenant-ID", tenant_id)
+            .send()
+            .await
+            .context("Failed to send start_scan request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Start scan failed: {} - {}", status, text);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -225,6 +292,33 @@ pub struct Case {
 #[derive(Deserialize, Debug)]
 struct CasesResponse {
     items: Vec<Case>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointHealth {
+    pub overall: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointIsolation {
+    pub is_isolated: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Endpoint {
+    pub id: String,
+    pub hostname: String,
+    pub health: Option<EndpointHealth>,
+    pub isolation: Option<EndpointIsolation>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct EndpointsResponse {
+    items: Vec<Endpoint>,
 }
 
 #[cfg(test)]

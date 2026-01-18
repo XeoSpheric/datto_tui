@@ -27,6 +27,24 @@ pub enum Event {
     ),
     SiteUpdated(Result<crate::api::datto::types::Site, String>),
     SophosCasesFetched(String, Result<Vec<crate::api::sophos::Case>, String>),
+    SophosEndpointsFetched(String, Result<Vec<crate::api::sophos::Endpoint>, String>), // (Hostname, Result)
+    SophosScanStarted(String, Result<(), String>), // (Hostname, Result)
+    DattoAvAgentFetched(
+        String,
+        Result<crate::api::datto_av::types::AgentDetail, String>,
+    ), // (Hostname, Result)
+    DattoAvScanStarted(String, Result<(), String>), // (Hostname, Result)
+    ScanStatusChanged(String, ScanStatus),
+    DattoAvAlertsFetched(
+        String,
+        Result<Vec<crate::api::datto_av::types::Alert>, String>,
+    ),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanStatus {
+    Starting,
+    Started,
 }
 
 #[derive(Debug)]

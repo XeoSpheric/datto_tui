@@ -15,17 +15,24 @@ pub struct RocketCyberConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct Config {
-    pub datto: DattoConfig,
-    pub rocket: RocketCyberConfig,
-    pub sophos: SophosConfig,
-}
-
-#[derive(Clone, Debug)]
 pub struct SophosConfig {
     pub partner_id: String,
     pub client_id: String,
     pub secret: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct DattoAvConfig {
+    pub url: String,
+    pub secret: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub datto: DattoConfig,
+    pub rocket: RocketCyberConfig,
+    pub sophos: SophosConfig,
+    pub datto_av: DattoAvConfig,
 }
 
 impl Config {
@@ -64,10 +71,20 @@ impl Config {
             secret,
         };
 
+        // Datto AV Config
+        let datto_av_url = env::var("DATTO_AV_URL").context("DATTO_AV_URL must be set")?;
+        let datto_av_secret = env::var("DATTO_AV_SECRET").context("DATTO_AV_SECRET must be set")?;
+
+        let datto_av_config = DattoAvConfig {
+            url: datto_av_url,
+            secret: datto_av_secret,
+        };
+
         Ok(Self {
             datto: datto_config,
             rocket: rocket_config,
             sophos: sophos_config,
+            datto_av: datto_av_config,
         })
     }
 }

@@ -12,9 +12,11 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::TableState;
 
+use crate::api::datto_av::DattoAvClient;
+use crate::api::datto_av::types::AgentDetail;
 use crate::api::rocket_cyber::RocketCyberClient;
 use crate::api::rocket_cyber::incidents::IncidentsApi;
-use crate::api::sophos::SophosClient;
+use crate::api::sophos::{Endpoint, SophosClient};
 use std::collections::HashMap;
 
 #[derive(Debug, Default, Clone)]
@@ -27,6 +29,7 @@ pub struct IncidentStats {
 pub enum CurrentView {
     List,
     Detail,
+    DeviceDetail,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -34,6 +37,13 @@ pub enum SiteDetailTab {
     Devices,
     Variables,
     Settings,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum DeviceDetailTab {
+    Variables,
+    Security,
+    Jobs,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -126,6 +136,7 @@ pub struct App {
     pub client: Option<DattoClient>,
     pub rocket_client: Option<RocketCyberClient>,
     pub sophos_client: Option<SophosClient>,
+    pub datto_av_client: Option<DattoAvClient>,
     pub current_view: CurrentView,
 
     // Navigation & Pagination (Sites)
@@ -140,6 +151,8 @@ pub struct App {
     pub devices_error: Option<String>,
     pub devices_table_state: TableState,
     pub detail_tab: SiteDetailTab,
+    pub selected_device: Option<Device>,
+    pub device_detail_tab: DeviceDetailTab,
 
     // Input
     pub input_state: InputState,
@@ -148,6 +161,23 @@ pub struct App {
     // Site Edit
     pub site_edit_state: SiteEditState,
     pub settings_table_state: TableState,
+
+    // UDF Edit
+    pub udf_table_state: TableState,
+    pub editing_udf_index: Option<usize>, // 1-30
+
+    // Sophos Data
+    pub sophos_endpoints: HashMap<String, Endpoint>, // Key: hostname
+    pub sophos_loading: HashMap<String, bool>,
+
+    // Datto AV Data
+    // Datto AV Data
+    pub datto_av_agents: HashMap<String, AgentDetail>, // Key: hostname
+    pub datto_av_loading: HashMap<String, bool>,
+    pub datto_av_alerts: HashMap<String, Vec<crate::api::datto_av::types::Alert>>, // Key: hostname
+
+    // Scan Loading States
+    pub scan_status: HashMap<String, crate::event::ScanStatus>, // Key: hostname
 }
 
 impl Default for App {
@@ -163,6 +193,7 @@ impl Default for App {
             client: None,
             rocket_client: None,
             sophos_client: None,
+            datto_av_client: None,
             current_view: CurrentView::List,
 
             table_state: TableState::default(),
@@ -175,10 +206,20 @@ impl Default for App {
             devices_error: None,
             devices_table_state: TableState::default(),
             detail_tab: SiteDetailTab::Devices,
+            selected_device: None,
+            device_detail_tab: DeviceDetailTab::Variables,
             input_state: InputState::default(),
             variables_table_state: TableState::default(),
             site_edit_state: SiteEditState::default(),
             settings_table_state: TableState::default(),
+            udf_table_state: TableState::default(),
+            editing_udf_index: None,
+            sophos_endpoints: HashMap::new(),
+            sophos_loading: HashMap::new(),
+            datto_av_agents: HashMap::new(),
+            datto_av_loading: HashMap::new(),
+            datto_av_alerts: HashMap::new(),
+            scan_status: HashMap::new(),
         }
     }
 }
@@ -188,11 +229,13 @@ impl App {
         client: Option<DattoClient>,
         rocket_client: Option<RocketCyberClient>,
         sophos_client: Option<SophosClient>,
+        datto_av_client: Option<DattoAvClient>,
     ) -> Self {
         let mut app = Self::default();
         app.client = client;
         app.rocket_client = rocket_client;
         app.sophos_client = sophos_client;
+        app.datto_av_client = datto_av_client;
         app
     }
 
@@ -226,211 +269,463 @@ impl App {
                 Event::Key(key) => self.handle_key_event(key, events.sender()),
                 Event::Mouse(_) => {}
                 Event::Resize(_, _) => {}
-                Event::SitesFetched(result) => {
-                    self.is_loading = false;
-                    match result {
-                        Ok(mut response) => {
-                            // Sort sites alphabetically by name
-                            response
-                                .sites
-                                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                            self.sites = response.sites;
+                event => self.handle_event(event, events.sender()).await?,
+            }
+        }
+        Ok(())
+    }
 
-                            // Update pagination info
-                            self.total_count = response.page_details.total_count.unwrap_or(0);
-                            // Calculate total pages (assuming max=50)
-                            if self.total_count > 0 {
-                                self.total_pages = (self.total_count as f64 / 50.0).ceil() as i32;
-                            } else {
-                                self.total_pages = 1;
-                            }
+    async fn handle_event(
+        &mut self,
+        event: Event,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) -> Result<()> {
+        match event {
+            Event::Tick | Event::Key(_) | Event::Mouse(_) | Event::Resize(_, _) => {}
+            Event::SitesFetched(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(mut response) => {
+                        // Sort sites alphabetically by name
+                        response
+                            .sites
+                            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                        self.sites = response.sites;
 
-                            if !self.sites.is_empty() {
-                                self.table_state.select(Some(0));
-                                // Fetch variables for all sites on this page
-                                for site in &self.sites {
-                                    self.fetch_site_variables(site.uid.clone(), events.sender());
-                                }
-                            } else {
-                                self.table_state.select(None);
-                            }
+                        // Update pagination info
+                        self.total_count = response.page_details.total_count.unwrap_or(0);
+                        // Calculate total pages (assuming max=50)
+                        if self.total_count > 0 {
+                            self.total_pages = (self.total_count as f64 / 50.0).ceil() as i32;
+                        } else {
+                            self.total_pages = 1;
                         }
-                        Err(e) => {
-                            self.error = Some(e.to_string());
-                        }
-                    }
-                }
-                Event::DevicesFetched(result) => {
-                    self.devices_loading = false;
-                    match result {
-                        Ok(response) => {
-                            self.devices = response.devices;
-                            if !self.devices.is_empty() {
-                                self.devices_table_state.select(Some(0));
-                            } else {
-                                self.devices_table_state.select(None);
+
+                        if !self.sites.is_empty() {
+                            self.table_state.select(Some(0));
+                            // Fetch variables for all sites on this page
+                            for site in &self.sites {
+                                self.fetch_site_variables(site.uid.clone(), tx.clone());
                             }
-                        }
-                        Err(e) => {
-                            self.devices_error = Some(e.to_string());
-                        }
-                    }
-                }
-                Event::IncidentsFetched(result) => match result {
-                    Ok(incidents) => {
-                        self.incidents = incidents;
-                        // Aggregate stats
-                        self.incident_stats.clear();
-                        for incident in &self.incidents {
-                            // Normalize name for matching: lowercase and trim
-                            let account_name = incident.account_name.to_lowercase();
-                            // This is a naive match key. In reality we might need a better mapping.
-                            // However Datto site names and RocketCyber account names are "close".
-                            // For now we will use the lowercase name from RocketCyber as the key.
-                            // When looking up from Datto Site, we will also lowercase that name.
-
-                            let entry = self
-                                .incident_stats
-                                .entry(account_name)
-                                .or_insert(IncidentStats::default());
-
-                            // Check status
-                            let status = incident.status.to_lowercase();
-                            if status == "resolved" {
-                                entry.resolved += 1;
-                            } else {
-                                entry.active += 1;
-                            }
-
-                            // Also index by Account ID for variable mapping
-                            let account_id = incident.account_id.to_string();
-                            let entry_id = self
-                                .incident_stats
-                                .entry(account_id)
-                                .or_insert(IncidentStats::default());
-
-                            if status == "resolved" {
-                                entry_id.resolved += 1;
-                            } else {
-                                entry_id.active += 1;
-                            }
+                        } else {
+                            self.table_state.select(None);
                         }
                     }
                     Err(e) => {
-                        self.error = Some(format!("Failed to fetch incidents: {}", e));
-                    }
-                },
-                Event::SiteVariablesFetched(site_uid, result) => match result {
-                    Ok(variables) => {
-                        if let Some(site) = self.sites.iter_mut().find(|s| s.uid == site_uid) {
-                            site.variables = Some(variables.clone());
-
-                            // Check for Sophos MDR
-                            for var in &variables {
-                                if var.name == "tuiMdrProvider" && var.value == "Sophos" {
-                                    // Find tuiMdrId
-                                    if let Some(id_var) =
-                                        variables.iter().find(|v| v.name == "tuiMdrId")
-                                    {
-                                        self.fetch_sophos_cases(
-                                            id_var.value.clone(),
-                                            events.sender(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(_e) => {
-                        // Log error or ignore? For now, maybe just print to stderr if debug
-                        // self.error = Some(format!("Failed to fetch variables for {}: {}", site_uid, e));
-                    }
-                },
-                Event::VariableCreated(site_uid, result) => {
-                    self.is_loading = false;
-                    match result {
-                        Ok(_) => {
-                            // Refresh variables
-                            self.fetch_site_variables(site_uid, events.sender());
-                        }
-                        Err(e) => self.error = Some(e),
+                        self.error = Some(e.to_string());
                     }
                 }
-                Event::VariableUpdated(site_uid, result) => {
-                    self.is_loading = false;
-                    match result {
-                        Ok(updated_var) => {
-                            // Update local state in place
-                            if let Some(site) = self.sites.iter_mut().find(|s| s.uid == site_uid) {
-                                if let Some(vars) = &mut site.variables {
-                                    if let Some(var) =
-                                        vars.iter_mut().find(|v| v.id == updated_var.id)
-                                    {
-                                        *var = updated_var;
-                                    }
-                                }
-                            }
-                            // Note: No need to re-fetch variables, providing immediate feedback!
+            }
+            Event::DevicesFetched(result) => {
+                self.devices_loading = false;
+                match result {
+                    Ok(response) => {
+                        self.devices = response.devices;
+                        if !self.devices.is_empty() {
+                            self.devices_table_state.select(Some(0));
+                        } else {
+                            self.devices_table_state.select(None);
                         }
-                        Err(e) => self.error = Some(e),
+                    }
+                    Err(e) => {
+                        self.devices_error = Some(e.to_string());
                     }
                 }
+            }
+            Event::IncidentsFetched(result) => match result {
+                Ok(incidents) => {
+                    self.incidents = incidents;
+                    // Aggregate stats
+                    self.incident_stats.clear();
+                    for incident in &self.incidents {
+                        // Normalize name for matching: lowercase and trim
+                        let account_name = incident.account_name.to_lowercase();
+                        // This is a naive match key. In reality we might need a better mapping.
+                        // However Datto site names and RocketCyber account names are "close".
+                        // For now we will use the lowercase name from RocketCyber as the key.
+                        // When looking up from Datto Site, we will also lowercase that name.
 
-                Event::SiteUpdated(result) => {
-                    self.is_loading = false;
-                    match result {
-                        Ok(updated_site) => {
-                            // Find and update the site in the local list
-                            if let Some(index) =
-                                self.sites.iter().position(|s| s.uid == updated_site.uid)
-                            {
-                                // Preserve variables as they are not returned in the update response (skipped)
-                                let vars = self.sites[index].variables.clone();
-                                self.sites[index] = updated_site;
-                                self.sites[index].variables = vars;
-
-                                // If this is the currently selected site, update the edit state to reflect changes in UI
-                                if let Some(selected_idx) = self.table_state.selected() {
-                                    if selected_idx == index {
-                                        self.populate_site_edit_state();
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => self.error = Some(e),
-                    }
-                }
-                Event::SophosCasesFetched(tenant_id, result) => match result {
-                    Ok(cases) => {
-                        // Update stats
                         let entry = self
                             .incident_stats
-                            .entry(tenant_id.clone())
+                            .entry(account_name)
                             .or_insert(IncidentStats::default());
 
-                        // Reset or accumulate? Probably reset for this tenant as it's a fresh fetch
-                        entry.active = 0;
-                        entry.resolved = 0;
+                        // Check status
+                        let status = incident.status.to_lowercase();
+                        if status == "resolved" {
+                            entry.resolved += 1;
+                        } else {
+                            entry.active += 1;
+                        }
 
-                        for case in cases {
-                            let status = case.status.as_deref().unwrap_or("").to_lowercase();
-                            if status == "resolved" || status == "closed" {
-                                // Assuming closed is also resolved
-                                entry.resolved += 1;
-                            } else {
-                                entry.active += 1;
+                        // Also index by Account ID for variable mapping
+                        let account_id = incident.account_id.to_string();
+                        let entry_id = self
+                            .incident_stats
+                            .entry(account_id)
+                            .or_insert(IncidentStats::default());
+
+                        if status == "resolved" {
+                            entry_id.resolved += 1;
+                        } else {
+                            entry_id.active += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(format!("Failed to fetch incidents: {}", e));
+                }
+            },
+            Event::SiteVariablesFetched(site_uid, result) => match result {
+                Ok(variables) => {
+                    if let Some(site) = self.sites.iter_mut().find(|s| s.uid == site_uid) {
+                        site.variables = Some(variables.clone());
+
+                        // Check for Sophos MDR
+                        for var in &variables {
+                            if var.name == "tuiMdrProvider" && var.value == "Sophos" {
+                                // Find tuiMdrId
+                                if let Some(id_var) =
+                                    variables.iter().find(|v| v.name == "tuiMdrId")
+                                {
+                                    // Check for tuiMdrRegion to skip tenant call
+                                    let region = variables
+                                        .iter()
+                                        .find(|v| v.name == "tuiMdrRegion")
+                                        .map(|v| v.value.clone());
+
+                                    self.fetch_sophos_cases(
+                                        id_var.value.clone(),
+                                        region,
+                                        tx.clone(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_e) => {
+                    // Log error or ignore? For now, maybe just print to stderr if debug
+                    // self.error = Some(format!("Failed to fetch variables for {}: {}", site_uid, e));
+                }
+            },
+            Event::VariableCreated(site_uid, result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(_) => {
+                        // Refresh variables
+                        self.fetch_site_variables(site_uid, tx.clone());
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            Event::VariableUpdated(site_uid, result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(updated_var) => {
+                        // Update local state in place
+                        if let Some(site) = self.sites.iter_mut().find(|s| s.uid == site_uid) {
+                            if let Some(vars) = &mut site.variables {
+                                if let Some(var) = vars.iter_mut().find(|v| v.id == updated_var.id)
+                                {
+                                    *var = updated_var;
+                                }
+                            }
+                        }
+                        // Note: No need to re-fetch variables, providing immediate feedback!
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+
+            Event::SiteUpdated(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(updated_site) => {
+                        // Find and update the site in the local list
+                        if let Some(index) =
+                            self.sites.iter().position(|s| s.uid == updated_site.uid)
+                        {
+                            // Preserve variables as they are not returned in the update response (skipped)
+                            let vars = self.sites[index].variables.clone();
+                            self.sites[index] = updated_site;
+                            self.sites[index].variables = vars;
+
+                            // If this is the currently selected site, update the edit state to reflect changes in UI
+                            if let Some(selected_idx) = self.table_state.selected() {
+                                if selected_idx == index {
+                                    self.populate_site_edit_state();
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            Event::SophosCasesFetched(tenant_id, result) => match result {
+                Ok(cases) => {
+                    // Update stats
+                    let entry = self
+                        .incident_stats
+                        .entry(tenant_id.clone())
+                        .or_insert(IncidentStats::default());
+
+                    // Reset or accumulate? Probably reset for this tenant as it's a fresh fetch
+                    entry.active = 0;
+                    entry.resolved = 0;
+
+                    for case in cases {
+                        let status = case.status.as_deref().unwrap_or("").to_lowercase();
+                        if status == "resolved" || status == "closed" {
+                            // Assuming closed is also resolved
+                            entry.resolved += 1;
+                        } else {
+                            entry.active += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(format!(
+                        "Failed to fetch Sophos cases for {}: {}",
+                        tenant_id, e
+                    ));
+                }
+            },
+            Event::SophosEndpointsFetched(hostname, result) => {
+                self.sophos_loading.insert(hostname.clone(), false);
+                match result {
+                    Ok(endpoints) => {
+                        if let Some(endpoint) = endpoints.first() {
+                            self.sophos_endpoints
+                                .insert(hostname.clone(), endpoint.clone());
+
+                            // Cache Endpoint ID in UDF 30 if different
+                            if let Some(device) =
+                                self.devices.iter().find(|d| d.hostname == hostname)
+                            {
+                                let current_udf30 = device
+                                    .udf
+                                    .as_ref()
+                                    .and_then(|u| u.udf30.as_ref())
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                if current_udf30 != endpoint.id {
+                                    // Update UDF 30 using DevicesApi
+                                    if let Some(client) = &self.client {
+                                        let device_uid = device.uid.clone();
+                                        let endpoint_id = endpoint.id.clone();
+                                        let client = client.clone();
+                                        tokio::spawn(async move {
+                                            let udf = crate::api::datto::types::Udf {
+                                                udf30: Some(endpoint_id),
+                                                udf1: None,
+                                                udf2: None,
+                                                udf3: None,
+                                                udf4: None,
+                                                udf5: None,
+                                                udf6: None,
+                                                udf7: None,
+                                                udf8: None,
+                                                udf9: None,
+                                                udf10: None,
+                                                udf11: None,
+                                                udf12: None,
+                                                udf13: None,
+                                                udf14: None,
+                                                udf15: None,
+                                                udf16: None,
+                                                udf17: None,
+                                                udf18: None,
+                                                udf19: None,
+                                                udf20: None,
+                                                udf21: None,
+                                                udf22: None,
+                                                udf23: None,
+                                                udf24: None,
+                                                udf25: None,
+                                                udf26: None,
+                                                udf27: None,
+                                                udf28: None,
+                                                udf29: None,
+                                            };
+
+                                            let _ =
+                                                client.update_device_udf(&device_uid, &udf).await;
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
                     Err(e) => {
                         self.error = Some(format!(
-                            "Failed to fetch Sophos cases for {}: {}",
-                            tenant_id, e
+                            "Failed to fetch Sophos endpoint for {}: {}",
+                            hostname, e
                         ));
                     }
-                },
+                }
             }
+            Event::SophosScanStarted(hostname, result) => {
+                match result {
+                    Ok(_) => {
+                        // Scan started logic: wait 2 seconds then update status
+                        let h = hostname.clone();
+                        let tx_clone = tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            tx_clone
+                                .send(Event::ScanStatusChanged(
+                                    h,
+                                    crate::event::ScanStatus::Started,
+                                ))
+                                .unwrap();
+                        });
+                    }
+                    Err(e) => {
+                        self.scan_status.remove(&hostname);
+                        self.error = Some(format!("Failed to start scan for {}: {}", hostname, e));
+                    }
+                }
+            }
+            Event::DattoAvAgentFetched(hostname, result) => {
+                self.datto_av_loading.insert(hostname.clone(), false);
+                match result {
+                    Ok(agent) => {
+                        self.datto_av_agents.insert(hostname.clone(), agent.clone());
+
+                        // Check/Update UDF 30 if needed
+                        // We only update if we found it via hostname (implying we might not have had ID)
+                        // OR just check if UDF 30 matches.
+                        // Check/Update UDF 30 if needed
+                        // First, find the index of the device to update to avoid borrow issues
+                        if let Some(dev_idx) =
+                            self.devices.iter().position(|d| d.hostname == hostname)
+                        {
+                            let device_uid = self.devices[dev_idx].uid.clone();
+                            let current_udf30 = self.devices[dev_idx]
+                                .udf
+                                .as_ref()
+                                .and_then(|u| u.udf30.as_ref())
+                                .map(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            if current_udf30 != agent.id {
+                                // Update UDF 30
+                                // Update local state immediately for responsiveness
+                                if let Some(udfs) = &mut self.devices[dev_idx].udf {
+                                    udfs.udf30 = Some(agent.id.clone());
+                                } else {
+                                    let mut new_udf = crate::api::datto::types::Udf::default();
+                                    new_udf.udf30 = Some(agent.id.clone());
+                                    self.devices[dev_idx].udf = Some(new_udf);
+                                }
+
+                                // Also update selected device if it matches
+                                if let Some(sel) = &mut self.selected_device {
+                                    if sel.uid == device_uid {
+                                        if let Some(udfs) = &mut sel.udf {
+                                            udfs.udf30 = Some(agent.id.clone());
+                                        } else {
+                                            let mut new_udf =
+                                                crate::api::datto::types::Udf::default();
+                                            new_udf.udf30 = Some(agent.id.clone());
+                                            sel.udf = Some(new_udf);
+                                        }
+                                    }
+                                }
+
+                                if let Some(client) = &self.client {
+                                    let agent_id = agent.id.clone();
+                                    let client = client.clone();
+                                    tokio::spawn(async move {
+                                        let udf = crate::api::datto::types::Udf {
+                                            udf30: Some(agent_id),
+                                            udf1: None,
+                                            udf2: None,
+                                            udf3: None,
+                                            udf4: None,
+                                            udf5: None,
+                                            udf6: None,
+                                            udf7: None,
+                                            udf8: None,
+                                            udf9: None,
+                                            udf10: None,
+                                            udf11: None,
+                                            udf12: None,
+                                            udf13: None,
+                                            udf14: None,
+                                            udf15: None,
+                                            udf16: None,
+                                            udf17: None,
+                                            udf18: None,
+                                            udf19: None,
+                                            udf20: None,
+                                            udf21: None,
+                                            udf22: None,
+                                            udf23: None,
+                                            udf24: None,
+                                            udf25: None,
+                                            udf26: None,
+                                            udf27: None,
+                                            udf28: None,
+                                            udf29: None,
+                                        };
+                                        let _ = client.update_device_udf(&device_uid, &udf).await;
+                                    });
+                                }
+                            }
+                        }
+
+                        // Fetch alerts for this agent
+                        self.fetch_datto_av_alerts(agent.id.clone(), hostname, tx.clone());
+                    }
+                    Err(e) => {
+                        self.error = Some(format!(
+                            "Failed to fetch Datto AV agent for {}: {}",
+                            hostname, e
+                        ));
+                    }
+                }
+            }
+            Event::DattoAvScanStarted(hostname, result) => {
+                match result {
+                    Ok(_) => {
+                        // Scan started logic: wait 2 seconds then update status
+                        let h = hostname.clone();
+                        let tx_clone = tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            tx_clone
+                                .send(Event::ScanStatusChanged(
+                                    h,
+                                    crate::event::ScanStatus::Started,
+                                ))
+                                .unwrap();
+                        });
+                    }
+                    Err(e) => {
+                        self.scan_status.remove(&hostname);
+                        self.error = Some(format!(
+                            "Failed to start Datto AV scan for {}: {}",
+                            hostname, e
+                        ));
+                    }
+                }
+            }
+            Event::ScanStatusChanged(hostname, status) => {
+                self.scan_status.insert(hostname, status);
+            }
+            Event::DattoAvAlertsFetched(hostname, result) => match result {
+                Ok(alerts) => {
+                    self.datto_av_alerts.insert(hostname, alerts);
+                }
+                Err(_e) => {
+                    // Ignore error for now, or log it
+                }
+            },
         }
+
         Ok(())
     }
 
@@ -495,15 +790,26 @@ impl App {
         }
     }
 
-    fn fetch_sophos_cases(&self, tenant_id: String, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+    fn fetch_sophos_cases(
+        &self,
+        tenant_id: String,
+        data_region: Option<String>,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
         if let Some(client) = &self.sophos_client {
             let client = client.clone();
             let t_id = tenant_id.clone();
             tokio::spawn(async move {
-                // First get tenant to find data region
+                // First get tenant to find data region IF not provided
                 let cases_result = async {
-                    let tenant = client.get_tenant(&t_id).await?;
-                    let cases = client.get_cases(&t_id, &tenant.data_region).await?;
+                    let region = if let Some(r) = data_region {
+                        r
+                    } else {
+                        let tenant = client.get_tenant(&t_id).await?;
+                        tenant.data_region
+                    };
+
+                    let cases = client.get_cases(&t_id, &region).await?;
                     Ok(cases)
                 }
                 .await
@@ -512,6 +818,179 @@ impl App {
                 tx.send(Event::SophosCasesFetched(tenant_id, cases_result))
                     .unwrap();
             });
+        }
+    }
+
+    fn fetch_sophos_endpoint(
+        &mut self,
+        tenant_id: String,
+        data_region: Option<String>,
+        hostname: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if self.sophos_endpoints.contains_key(&hostname) {
+            // Already have data? Maybe refresh? For now, if we have it, skip or always fetch?
+            // Let's always fetch to be safe or maybe check if we want to cache.
+            // The instructions say "if the antivirus name contains Sophos...".
+            // Implementation: Always fetch for now as this is called via user action or specific criteria.
+        }
+
+        if let Some(client) = &self.sophos_client {
+            let client = client.clone();
+            let t_id = tenant_id.clone();
+            let h_name = hostname.clone();
+
+            // Set loading
+            self.sophos_loading.insert(hostname.clone(), true);
+
+            tokio::spawn(async move {
+                let endpoints_result = async {
+                    let region = if let Some(r) = data_region {
+                        r
+                    } else {
+                        // We might need to fetch tenant to get region if not passed.
+                        // However in the calling code (handle_key_event) we might not have region easily if we don't have variables.
+                        // But we plan to look up from variables.
+                        let tenant = client.get_tenant(&t_id).await?;
+                        tenant.data_region
+                    };
+
+                    let endpoints = client.get_endpoints(&t_id, &region, &h_name).await?;
+                    Ok(endpoints)
+                }
+                .await
+                .map_err(|e: anyhow::Error| e.to_string());
+
+                tx.send(Event::SophosEndpointsFetched(h_name, endpoints_result))
+                    .unwrap();
+            });
+        }
+    }
+
+    fn fetch_datto_av_agent(
+        &mut self,
+        hostname: String,
+        udf: Option<crate::api::datto::types::Udf>,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = &self.datto_av_client {
+            let client = client.clone();
+            let h_name = hostname.clone();
+
+            // Check UDF 30 for ID
+            let agent_id = udf.as_ref().and_then(|u| u.udf30.clone());
+
+            self.datto_av_loading.insert(hostname.clone(), true);
+
+            tokio::spawn(async move {
+                let result = async {
+                    if let Some(id) = agent_id {
+                        if !id.is_empty() {
+                            match client.get_agent_detail(&id).await {
+                                Ok(agent) => return Ok(agent),
+                                Err(_) => {
+                                    // Ignored error (likely ID mismatch or network glitch), falling back to hostname search
+                                }
+                            }
+                        }
+                    }
+                    // Fallback to filter search by hostname
+                    let agents = client.get_agent_details(&h_name).await?;
+                    // Assuming we want the first match if any
+                    agents
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("No agent found"))
+                }
+                .await
+                .map_err(|e| e.to_string());
+
+                tx.send(Event::DattoAvAgentFetched(h_name, result)).unwrap();
+            });
+        }
+    }
+
+    fn fetch_datto_av_alerts(
+        &self,
+        agent_id: String,
+        hostname: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = &self.datto_av_client {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .get_agent_alerts(&agent_id)
+                    .await
+                    .map_err(|e| e.to_string());
+                tx.send(Event::DattoAvAlertsFetched(hostname, result))
+                    .unwrap();
+            });
+        }
+    }
+
+    fn scan_datto_av_agent(
+        &mut self,
+        agent_id: String,
+        hostname: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = &self.datto_av_client {
+            self.scan_status
+                .insert(hostname.clone(), crate::event::ScanStatus::Starting);
+            let client = client.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .scan_agent(&agent_id)
+                    .await
+                    .map_err(|e| e.to_string());
+                tx.send(Event::DattoAvScanStarted(hostname, result))
+                    .unwrap();
+            });
+        }
+    }
+
+    fn scan_sophos_endpoint(
+        &mut self,
+        endpoint_id: String,
+        hostname: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(device) = &self.selected_device {
+            // We need tenant ID and region.
+            if let Some(site) = self.sites.iter().find(|s| s.uid == device.site_uid) {
+                if let Some(vars) = &site.variables {
+                    if let Some(id_var) = vars.iter().find(|v| v.name == "tuiMdrId") {
+                        let region = vars
+                            .iter()
+                            .find(|v| v.name == "tuiMdrRegion")
+                            .map(|v| v.value.clone());
+
+                        if let Some(client) = &self.sophos_client {
+                            let client = client.clone();
+                            let t_id = id_var.value.clone();
+                            self.scan_status
+                                .insert(hostname.clone(), crate::event::ScanStatus::Starting);
+
+                            tokio::spawn(async move {
+                                let result = async {
+                                    let region = if let Some(r) = region {
+                                        r
+                                    } else {
+                                        let tenant = client.get_tenant(&t_id).await?;
+                                        tenant.data_region
+                                    };
+                                    client.start_scan(&t_id, &region, &endpoint_id).await
+                                }
+                                .await
+                                .map_err(|e| e.to_string());
+
+                                tx.send(Event::SophosScanStarted(hostname, result)).unwrap();
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -546,6 +1025,9 @@ impl App {
                             }
                         }
                         self.submit_site_update(tx);
+                    } else if let Some(_) = self.editing_udf_index {
+                        // UDF Submit
+                        self.submit_device_udf(tx);
                     } else {
                         // Variable Submit
                         self.submit_variable(tx);
@@ -554,12 +1036,15 @@ impl App {
                 }
                 KeyCode::Tab => {
                     // Switch field
-                    self.input_state.active_field = match self.input_state.active_field {
-                        InputField::Name => InputField::Value,
-                        InputField::Value => InputField::Name,
-                        // No tab switching for simple single-field settings edits for now, keep it simple
-                        _ => self.input_state.active_field,
-                    };
+                    // Only switch if NOT editing a UDF (UDFs are single value only)
+                    if self.editing_udf_index.is_none() {
+                        self.input_state.active_field = match self.input_state.active_field {
+                            InputField::Name => InputField::Value,
+                            InputField::Value => InputField::Name,
+                            // No tab switching for simple single-field settings edits for now, keep it simple
+                            _ => self.input_state.active_field,
+                        };
+                    }
                 }
                 KeyCode::Backspace => {
                     match self.input_state.active_field {
@@ -627,6 +1112,14 @@ impl App {
                     }
                 }
                 // Determine context based on tab
+                KeyCode::Enter if self.detail_tab == SiteDetailTab::Devices => {
+                    if let Some(idx) = self.devices_table_state.selected() {
+                        if let Some(device) = self.devices.get(idx) {
+                            self.selected_device = Some(device.clone());
+                            self.current_view = CurrentView::DeviceDetail;
+                        }
+                    }
+                }
                 KeyCode::Char('j') | KeyCode::Down => match self.detail_tab {
                     SiteDetailTab::Devices => self.next_device(),
                     SiteDetailTab::Variables => self.next_variable(),
@@ -668,6 +1161,180 @@ impl App {
                 {
                     // Toggle boolean settings for quick action, or submit if purely selecting
                     self.toggle_setting(tx.clone());
+                }
+                _ => {}
+            },
+            CurrentView::DeviceDetail => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    // Clear scan loading state for this device if needed
+                    if let Some(device) = &self.selected_device {
+                        self.scan_status.remove(&device.hostname);
+                    }
+                    self.current_view = CurrentView::Detail;
+                    self.selected_device = None;
+                    // Reset tab to default when leaving? Or keep state? Resetting is safer for now.
+                    self.device_detail_tab = DeviceDetailTab::Variables;
+                }
+                KeyCode::Tab => {
+                    self.device_detail_tab = match self.device_detail_tab {
+                        DeviceDetailTab::Variables => DeviceDetailTab::Security,
+                        DeviceDetailTab::Security => DeviceDetailTab::Jobs,
+                        DeviceDetailTab::Jobs => DeviceDetailTab::Variables,
+                    };
+
+                    if self.device_detail_tab == DeviceDetailTab::Security {
+                        let fetch_data = if let Some(device) = &self.selected_device {
+                            let is_sophos = device
+                                .antivirus
+                                .as_ref()
+                                .and_then(|av| av.antivirus_product.as_ref())
+                                .map(|prod| prod.to_lowercase().contains("sophos"))
+                                .unwrap_or(false);
+
+                            let is_datto = device
+                                .antivirus
+                                .as_ref()
+                                .and_then(|av| av.antivirus_product.as_ref())
+                                .map(|prod| prod.to_lowercase().contains("datto"))
+                                .unwrap_or(false);
+
+                            Some((
+                                is_sophos,
+                                is_datto,
+                                device.site_uid.clone(),
+                                device.hostname.clone(),
+                                device.udf.clone(),
+                            ))
+                        } else {
+                            None
+                        };
+
+                        if let Some((is_sophos, is_datto, site_uid, hostname, udf)) = fetch_data {
+                            if is_sophos {
+                                // Find site variables for tuiMdrId
+                                let sophos_params = if let Some(site) =
+                                    self.sites.iter().find(|s| s.uid == site_uid)
+                                {
+                                    if let Some(vars) = &site.variables {
+                                        if let Some(id_var) =
+                                            vars.iter().find(|v| v.name == "tuiMdrId")
+                                        {
+                                            let region = vars
+                                                .iter()
+                                                .find(|v| v.name == "tuiMdrRegion")
+                                                .map(|v| v.value.clone());
+                                            Some((id_var.value.clone(), region))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                if let Some((id, region)) = sophos_params {
+                                    self.fetch_sophos_endpoint(
+                                        id,
+                                        region,
+                                        hostname.clone(),
+                                        tx.clone(),
+                                    );
+                                }
+                            }
+
+                            if is_datto {
+                                self.fetch_datto_av_agent(hostname, udf, tx.clone());
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('s') if self.device_detail_tab == DeviceDetailTab::Security => {
+                    // Check if we have an endpoint ID
+                    if let Some(device) = &self.selected_device {
+                        // Prevent spamming
+                        if self.scan_status.contains_key(&device.hostname) {
+                            return;
+                        }
+
+                        let mut endpoint_id = None;
+                        // First check UDF30
+                        if let Some(udf) = &device.udf {
+                            if let Some(id) = &udf.udf30 {
+                                if !id.is_empty() {
+                                    endpoint_id = Some(id.clone());
+                                }
+                            }
+                        }
+                        // Then check fetched endpoints
+                        if endpoint_id.is_none() {
+                            if let Some(endpoint) = self.sophos_endpoints.get(&device.hostname) {
+                                endpoint_id = Some(endpoint.id.clone());
+                            }
+                        }
+
+                        if let Some(id) = endpoint_id {
+                            let is_sophos = device
+                                .antivirus
+                                .as_ref()
+                                .and_then(|av| av.antivirus_product.as_ref())
+                                .map(|prod| prod.to_lowercase().contains("sophos"))
+                                .unwrap_or(false);
+
+                            let is_datto = device
+                                .antivirus
+                                .as_ref()
+                                .and_then(|av| av.antivirus_product.as_ref())
+                                .map(|prod| prod.to_lowercase().contains("datto"))
+                                .unwrap_or(false);
+
+                            if is_sophos {
+                                self.scan_sophos_endpoint(
+                                    id.clone(),
+                                    device.hostname.clone(),
+                                    tx.clone(),
+                                );
+                            } else if is_datto {
+                                self.scan_datto_av_agent(id, device.hostname.clone(), tx.clone());
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('j') | KeyCode::Down
+                    if self.device_detail_tab == DeviceDetailTab::Variables =>
+                {
+                    let next = match self.udf_table_state.selected() {
+                        Some(i) => {
+                            if i >= 29 {
+                                0
+                            } else {
+                                i + 1
+                            }
+                        }
+                        None => 0,
+                    };
+                    self.udf_table_state.select(Some(next));
+                }
+                KeyCode::Char('k') | KeyCode::Up
+                    if self.device_detail_tab == DeviceDetailTab::Variables =>
+                {
+                    let next = match self.udf_table_state.selected() {
+                        Some(i) => {
+                            if i == 0 {
+                                29
+                            } else {
+                                i - 1
+                            }
+                        }
+                        None => 0,
+                    };
+                    self.udf_table_state.select(Some(next));
+                }
+                KeyCode::Enter | KeyCode::Char(' ')
+                    if self.device_detail_tab == DeviceDetailTab::Variables =>
+                {
+                    self.open_edit_udf_modal();
                 }
                 _ => {}
             },
@@ -1004,6 +1671,157 @@ impl App {
             _ => {
                 // If it's a text field, Enter also behaves like 'e' -> Open Edit
                 self.open_edit_setting_modal();
+            }
+        }
+    }
+
+    pub fn open_edit_udf_modal(&mut self) {
+        if let Some(device) = &self.selected_device {
+            if let Some(idx) = self.udf_table_state.selected() {
+                // Get current value
+                let val = if let Some(udf) = &device.udf {
+                    match idx {
+                        0 => udf.udf1.clone(),
+                        1 => udf.udf2.clone(),
+                        2 => udf.udf3.clone(),
+                        3 => udf.udf4.clone(),
+                        4 => udf.udf5.clone(),
+                        5 => udf.udf6.clone(),
+                        6 => udf.udf7.clone(),
+                        7 => udf.udf8.clone(),
+                        8 => udf.udf9.clone(),
+                        9 => udf.udf10.clone(),
+                        10 => udf.udf11.clone(),
+                        11 => udf.udf12.clone(),
+                        12 => udf.udf13.clone(),
+                        13 => udf.udf14.clone(),
+                        14 => udf.udf15.clone(),
+                        15 => udf.udf16.clone(),
+                        16 => udf.udf17.clone(),
+                        17 => udf.udf18.clone(),
+                        18 => udf.udf19.clone(),
+                        19 => udf.udf20.clone(),
+                        20 => udf.udf21.clone(),
+                        21 => udf.udf22.clone(),
+                        22 => udf.udf23.clone(),
+                        23 => udf.udf24.clone(),
+                        24 => udf.udf25.clone(),
+                        25 => udf.udf26.clone(),
+                        26 => udf.udf27.clone(),
+                        27 => udf.udf28.clone(),
+                        28 => udf.udf29.clone(),
+                        29 => udf.udf30.clone(),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                self.input_state = InputState {
+                    mode: InputMode::Editing,
+                    name_buffer: format!("UDF {}", idx + 1), // Using name buffer for Label display
+                    value_buffer: val.unwrap_or_default(),
+                    active_field: InputField::Value, // Start on Value
+                    is_creating: false,
+                    editing_variable_id: None,
+                    editing_setting: None,
+                };
+                self.editing_udf_index = Some(idx);
+            }
+        }
+    }
+
+    pub fn submit_device_udf(&mut self, _tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(mut device) = self.selected_device.take() {
+            if let Some(idx) = self.editing_udf_index {
+                let new_val = self.input_state.value_buffer.clone();
+                // Update local device UDF
+                let mut udf = device.udf.clone().unwrap_or(crate::api::datto::types::Udf {
+                    udf1: None,
+                    udf2: None,
+                    udf3: None,
+                    udf4: None,
+                    udf5: None,
+                    udf6: None,
+                    udf7: None,
+                    udf8: None,
+                    udf9: None,
+                    udf10: None,
+                    udf11: None,
+                    udf12: None,
+                    udf13: None,
+                    udf14: None,
+                    udf15: None,
+                    udf16: None,
+                    udf17: None,
+                    udf18: None,
+                    udf19: None,
+                    udf20: None,
+                    udf21: None,
+                    udf22: None,
+                    udf23: None,
+                    udf24: None,
+                    udf25: None,
+                    udf26: None,
+                    udf27: None,
+                    udf28: None,
+                    udf29: None,
+                    udf30: None,
+                });
+
+                let val_opt = Some(new_val.clone());
+
+                // Update specific field
+                match idx {
+                    0 => udf.udf1 = val_opt,
+                    1 => udf.udf2 = val_opt,
+                    2 => udf.udf3 = val_opt,
+                    3 => udf.udf4 = val_opt,
+                    4 => udf.udf5 = val_opt,
+                    5 => udf.udf6 = val_opt,
+                    6 => udf.udf7 = val_opt,
+                    7 => udf.udf8 = val_opt,
+                    8 => udf.udf9 = val_opt,
+                    9 => udf.udf10 = val_opt,
+                    10 => udf.udf11 = val_opt,
+                    11 => udf.udf12 = val_opt,
+                    12 => udf.udf13 = val_opt,
+                    13 => udf.udf14 = val_opt,
+                    14 => udf.udf15 = val_opt,
+                    15 => udf.udf16 = val_opt,
+                    16 => udf.udf17 = val_opt,
+                    17 => udf.udf18 = val_opt,
+                    18 => udf.udf19 = val_opt,
+                    19 => udf.udf20 = val_opt,
+                    20 => udf.udf21 = val_opt,
+                    21 => udf.udf22 = val_opt,
+                    22 => udf.udf23 = val_opt,
+                    23 => udf.udf24 = val_opt,
+                    24 => udf.udf25 = val_opt,
+                    25 => udf.udf26 = val_opt,
+                    26 => udf.udf27 = val_opt,
+                    27 => udf.udf28 = val_opt,
+                    28 => udf.udf29 = val_opt,
+                    29 => udf.udf30 = val_opt,
+                    _ => {}
+                }
+
+                device.udf = Some(udf.clone());
+                self.selected_device = Some(device.clone()); // Restore with updated value locally
+                self.editing_udf_index = None;
+
+                // API Call
+                if let Some(client) = self.client.clone() {
+                    let device_uid = device.uid.clone();
+                    tokio::spawn(async move {
+                        // Ignoring result for now as per previous pattern or log to stderr
+                        if let Err(e) = client.update_device_udf(&device_uid, &udf).await {
+                            eprintln!("Failed to update UDF: {}", e);
+                        }
+                    });
+                }
+            } else {
+                self.selected_device = Some(device); // Restore
             }
         }
     }
