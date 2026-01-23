@@ -219,6 +219,9 @@ pub struct App {
     pub device_search_table_state: TableState,
     pub last_search_input: Option<std::time::Instant>,
     pub last_searched_query: String,
+
+    // Device Variables Popup
+    pub show_device_variables: bool,
 }
 
 impl Default for App {
@@ -288,6 +291,8 @@ impl Default for App {
             device_search_table_state: TableState::default(),
             last_search_input: None,
             last_searched_query: String::new(),
+
+            show_device_variables: false,
         }
     }
 }
@@ -1611,6 +1616,14 @@ impl App {
                                     tx.clone(),
                                 );
                             }
+
+                            // Always fetch activities when entering device detail
+                            self.fetch_activity_logs(
+                                device.uid.clone(),
+                                device.id,
+                                device.site_id,
+                                tx.clone(),
+                            );
                         }
                     }
                 }
@@ -1658,101 +1671,99 @@ impl App {
                 }
                 _ => {}
             },
-            CurrentView::DeviceDetail => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    // Clear scan loading state for this device if needed
-                    if let Some(device) = &self.selected_device {
-                        self.scan_status.remove(&device.hostname);
-                    }
-                    self.current_view = CurrentView::Detail;
-                    self.selected_device = None;
-                    // Reset tab to default when leaving? Or keep state? Resetting is safer for now.
-                    self.device_detail_tab = DeviceDetailTab::Variables;
-                }
-                KeyCode::Tab => {
-                    self.device_detail_tab = match self.device_detail_tab {
-                        DeviceDetailTab::Variables => {
-                            if let Some(device) = &self.selected_device {
-                                self.fetch_activity_logs(
-                                    device.uid.clone(),
-                                    device.id,
-                                    device.site_id,
-                                    tx.clone(),
-                                );
-                            }
-                            DeviceDetailTab::Jobs
+            CurrentView::DeviceDetail => {
+                if self.show_device_variables {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('q') => {
+                            self.show_device_variables = false;
                         }
-                        DeviceDetailTab::Jobs => DeviceDetailTab::Variables,
-                    };
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            let next = match self.udf_table_state.selected() {
+                                Some(i) => {
+                                    if i >= 29 {
+                                        0
+                                    } else {
+                                        i + 1
+                                    }
+                                }
+                                None => 0,
+                            };
+                            self.udf_table_state.select(Some(next));
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            let next = match self.udf_table_state.selected() {
+                                Some(i) => {
+                                    if i == 0 {
+                                        29
+                                    } else {
+                                        i - 1
+                                    }
+                                }
+                                None => 0,
+                            };
+                            self.udf_table_state.select(Some(next));
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            self.open_edit_udf_modal();
+                        }
+                        _ => {}
+                    }
+                    return;
                 }
-                KeyCode::Char('j') | KeyCode::Down
-                    if self.device_detail_tab == DeviceDetailTab::Jobs =>
-                {
-                    self.next_activity_log();
-                }
-                KeyCode::Char('k') | KeyCode::Up
-                    if self.device_detail_tab == DeviceDetailTab::Jobs =>
-                {
-                    self.prev_activity_log();
-                }
-                KeyCode::Enter | KeyCode::Char(' ')
-                    if self.device_detail_tab == DeviceDetailTab::Jobs =>
-                {
-                    if let Some(idx) = self.activity_logs_table_state.selected() {
-                        if let Some(log) = self.activity_logs.get(idx) {
-                            self.selected_activity_log = Some(log.clone());
-                            self.current_view = CurrentView::ActivityDetail;
 
-                            // Parse job ID from details and fetch job result
-                            if let Some(details) = &log.details {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(details) {
-                                    if let Some(job_uid) = parsed.get("job.uid").and_then(|v| v.as_str()) {
-                                        if let Some(device) = &self.selected_device {
-                                            self.fetch_job_result(job_uid.to_string(), device.uid.clone(), tx.clone());
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        // Clear scan loading state for this device if needed
+                        if let Some(device) = &self.selected_device {
+                            self.scan_status.remove(&device.hostname);
+                        }
+                        self.current_view = CurrentView::Detail;
+                        self.selected_device = None;
+                        // Reset tab to default when leaving? Or keep state? Resetting is safer for now.
+                        self.device_detail_tab = DeviceDetailTab::Variables;
+                    }
+                    KeyCode::Char('v') => {
+                        self.show_device_variables = true;
+                        if self.udf_table_state.selected().is_none() {
+                            self.udf_table_state.select(Some(0));
+                        }
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.next_activity_log();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.prev_activity_log();
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        if let Some(idx) = self.activity_logs_table_state.selected() {
+                            if let Some(log) = self.activity_logs.get(idx) {
+                                self.selected_activity_log = Some(log.clone());
+                                self.current_view = CurrentView::ActivityDetail;
+
+                                // Parse job ID from details and fetch job result
+                                if let Some(details) = &log.details {
+                                    if let Ok(parsed) =
+                                        serde_json::from_str::<serde_json::Value>(details)
+                                    {
+                                        if let Some(job_uid) =
+                                            parsed.get("job.uid").and_then(|v| v.as_str())
+                                        {
+                                            if let Some(device) = &self.selected_device {
+                                                self.fetch_job_result(
+                                                    job_uid.to_string(),
+                                                    device.uid.clone(),
+                                                    tx.clone(),
+                                                );
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
+                    _ => {}
                 }
-                KeyCode::Char('j') | KeyCode::Down
-                    if self.device_detail_tab == DeviceDetailTab::Variables =>
-                {
-                    let next = match self.udf_table_state.selected() {
-                        Some(i) => {
-                            if i >= 29 {
-                                0
-                            } else {
-                                i + 1
-                            }
-                        }
-                        None => 0,
-                    };
-                    self.udf_table_state.select(Some(next));
-                }
-                KeyCode::Char('k') | KeyCode::Up
-                    if self.device_detail_tab == DeviceDetailTab::Variables =>
-                {
-                    let next = match self.udf_table_state.selected() {
-                        Some(i) => {
-                            if i == 0 {
-                                29
-                            } else {
-                                i - 1
-                            }
-                        }
-                        None => 0,
-                    };
-                    self.udf_table_state.select(Some(next));
-                }
-                KeyCode::Enter | KeyCode::Char(' ')
-                    if self.device_detail_tab == DeviceDetailTab::Variables =>
-                {
-                    self.open_edit_udf_modal();
-                }
-                _ => {}
-            },
+            }
             CurrentView::ActivityDetail => {
                 if self.show_popup {
                     match key.code {

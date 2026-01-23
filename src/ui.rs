@@ -1,6 +1,4 @@
-use crate::app::{
-    App, CurrentView, DeviceDetailTab, InputField, InputMode, JobViewRow, SiteDetailTab,
-};
+use crate::app::{App, CurrentView, InputField, InputMode, JobViewRow, SiteDetailTab};
 use crate::app_helpers::generate_job_rows;
 use chrono::DateTime;
 use ratatui::{
@@ -567,39 +565,32 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn render_device_detail(app: &mut App, frame: &mut Frame, area: Rect) {
-    if let Some(device) = &app.selected_device {
+    let selected_device_opt = app.selected_device.clone();
+
+    if let Some(device) = selected_device_opt {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
 
         // --- Left Pane: Device Info ---
-        render_device_info(device, frame, chunks[0]);
+        render_device_info(&device, frame, chunks[0]);
 
-        // --- Right Pane: Tabs & Content ---
+        // --- Right Pane: Security & Activities ---
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .constraints([
+                Constraint::Percentage(30), // Security Info (Top)
+                Constraint::Percentage(70), // Activities (Bottom)
+            ])
             .split(chunks[1]);
 
-        let tabs = Tabs::new(vec!["Variables", "Jobs"])
-            .select(match app.device_detail_tab {
-                DeviceDetailTab::Variables => 0,
-                DeviceDetailTab::Jobs => 1,
-            })
-            .block(Block::default().borders(Borders::ALL).title("Tabs"))
-            .highlight_style(
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(Color::Cyan),
-            );
-        frame.render_widget(tabs, right_chunks[0]);
+        render_device_security(app, &device, frame, right_chunks[0]);
+        render_device_activities(app, frame, right_chunks[1]);
 
-        match app.device_detail_tab {
-            DeviceDetailTab::Variables => {
-                render_device_variables(device, frame, right_chunks[1], &mut app.udf_table_state)
-            }
-            DeviceDetailTab::Jobs => render_device_jobs(app, frame, right_chunks[1]),
+        // --- Variables Popup ---
+        if app.show_device_variables {
+            render_device_variables_popup(&device, frame, &mut app.udf_table_state);
         }
     } else {
         frame.render_widget(
@@ -616,18 +607,51 @@ fn render_device_info(device: &crate::api::datto::types::Device, frame: &mut Fra
     let last_audit_str = format_timestamp(device.last_audit_date.clone());
     let creation_date_str = format_timestamp(device.creation_date.clone());
 
+    // --- Patch Status Logic ---
+    let patch_status_raw = device
+        .patch_management
+        .as_ref()
+        .and_then(|pm| pm.patch_status.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let (patch_status_text, patch_color) = match patch_status_raw.as_str() {
+        "FullyPatched" => ("Fully Patched", Color::Green),
+        "ApprovedPending" => ("Approved Pending", Color::Cyan),
+        "InstallError" => ("Install Error", Color::Yellow),
+        "RebootRequired" => ("Reboot Required", Color::Rgb(255, 165, 0)), // Orange
+        "NoData" => ("No Data", Color::Red),
+        "NoPolicy" => ("No Policy", Color::Gray),
+        _ => (patch_status_raw.as_str(), Color::White),
+    };
+
+    // --- Warranty Logic ---
+    let warranty_date_str = device.warranty_date.as_deref().unwrap_or("N/A");
+    let warranty_color = if warranty_date_str == "N/A" {
+        Color::Red
+    } else {
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(warranty_date_str, "%Y-%m-%d") {
+            let today = chrono::Local::now().date_naive();
+            let duration = date.signed_duration_since(today);
+            if duration.num_days() < 0 {
+                Color::Red // Expired
+            } else if duration.num_days() <= 30 {
+                Color::Yellow // Coming up
+            } else {
+                Color::Green // OK
+            }
+        } else {
+            Color::White // Parse error
+        }
+    };
+
     let text = vec![
         Line::from(vec![
-            Span::styled("Hostname: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(&device.hostname),
-        ]),
-        Line::from(vec![
-            Span::styled("UID: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(&device.uid),
-        ]),
-        Line::from(vec![
-            Span::styled("ID: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(device.id.to_string()),
+            Span::styled(
+                "Patch Status: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("■ ", Style::default().fg(patch_color)),
+            Span::raw(patch_status_text),
         ]),
         Line::from(vec![
             Span::styled("Site: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -647,17 +671,6 @@ fn render_device_info(device: &crate::api::datto::types::Device, frame: &mut Fra
         Line::from(vec![
             Span::styled("Last User: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(device.last_logged_in_user.as_deref().unwrap_or("N/A")),
-        ]),
-        Line::from(vec![
-            Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(
-                if device.online { "Online" } else { "Offline" },
-                if device.online {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default().fg(Color::Gray)
-                },
-            ),
         ]),
         Line::from(vec![
             Span::styled("Int. IP: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -695,26 +708,30 @@ fn render_device_info(device: &crate::api::datto::types::Device, frame: &mut Fra
         ]),
         Line::from(vec![
             Span::styled("Warranty: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(device.warranty_date.as_deref().unwrap_or("N/A")),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Patch Status: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(
-                device
-                    .patch_management
-                    .as_ref()
-                    .and_then(|pm| pm.patch_status.clone())
-                    .unwrap_or_else(|| "Unknown".to_string()),
-            ),
+            Span::styled("■ ", Style::default().fg(warranty_color)),
+            Span::raw(warranty_date_str),
         ]),
     ];
 
-    let info_block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!("Device Info: {}", device.hostname));
+    let status_color = if device.online {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+    let status_text = if device.online { "Online" } else { "Offline" };
+
+    let title = Line::from(vec![
+        Span::raw("Device Info: "),
+        Span::styled(
+            &device.hostname,
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" - "),
+        Span::styled("■ ", Style::default().fg(status_color)),
+        Span::raw(status_text),
+    ]);
+
+    let info_block = Block::default().borders(Borders::ALL).title(title);
 
     let p = Paragraph::new(text)
         .block(info_block)
@@ -744,15 +761,18 @@ fn format_timestamp(ts_option: Option<serde_json::Value>) -> String {
     "N/A".to_string()
 }
 
-fn render_device_variables(
+fn render_device_variables_popup(
     device: &crate::api::datto::types::Device,
     frame: &mut Frame,
-    area: Rect,
     state: &mut TableState,
 ) {
+    let area = centered_rect(60, 60, frame.area());
+    frame.render_widget(Clear, area);
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("User Defined Fields (UDF) - Press 'Enter' to Edit");
+        .title("Variables (UDF) - Press 'Enter' to Edit | 'Esc'/'v' to close")
+        .style(Style::default().bg(Color::DarkGray));
 
     let mut rows = Vec::new();
 
@@ -820,13 +840,11 @@ fn render_device_variables(
     frame.render_stateful_widget(table, area, state);
 }
 
-fn render_device_jobs(app: &mut App, frame: &mut Frame, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Activity Logs (Jobs)");
+fn render_device_activities(app: &mut App, frame: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title("Activities");
 
     if app.activity_logs_loading {
-        frame.render_widget(Paragraph::new("Loading logs...").block(block), area);
+        frame.render_widget(Paragraph::new("Loading activities...").block(block), area);
         return;
     }
 
@@ -841,7 +859,7 @@ fn render_device_jobs(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 
     if app.activity_logs.is_empty() {
-        frame.render_widget(Paragraph::new("No activity logs found.").block(block), area);
+        frame.render_widget(Paragraph::new("No activities found.").block(block), area);
         return;
     }
 
@@ -857,7 +875,6 @@ fn render_device_jobs(app: &mut App, frame: &mut Frame, area: Rect) {
             };
 
             // Convert date (f64 timestamp) to readable string
-            // Assuming date is in seconds.millis format (e.g. 1689072497.714)
             let date_str = if let Some(ts) = log.date {
                 let seconds = ts as i64;
                 let nanos = ((ts - seconds as f64) * 1_000_000_000.0) as u32;
@@ -917,7 +934,7 @@ fn render_device_jobs(app: &mut App, frame: &mut Frame, area: Rect) {
         rows,
         [
             Constraint::Length(22),     // Time
-            Constraint::Percentage(40), // Job Name (was Details)
+            Constraint::Percentage(40), // Job Name
             Constraint::Length(12),     // Status
             Constraint::Length(15),     // Action
             Constraint::Length(10),     // Category
@@ -926,7 +943,7 @@ fn render_device_jobs(app: &mut App, frame: &mut Frame, area: Rect) {
     )
     .header(
         Row::new(vec![
-            "Time", "Job Name", "Status", "Action", "Category", "User",
+            "Time", "Activity", "Status", "Action", "Category", "User",
         ])
         .style(Style::default().add_modifier(Modifier::BOLD)),
     )
@@ -934,6 +951,128 @@ fn render_device_jobs(app: &mut App, frame: &mut Frame, area: Rect) {
     .highlight_symbol(">> ");
 
     frame.render_stateful_widget(table, area, &mut app.activity_logs_table_state);
+}
+
+fn render_device_security(
+    app: &mut App,
+    device: &crate::api::datto::types::Device,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let block = Block::default().borders(Borders::ALL).title("Security");
+
+    let mut lines = Vec::new();
+
+    // Determine Security Product
+    let av_product = device
+        .antivirus
+        .as_ref()
+        .and_then(|av| av.antivirus_product.as_ref())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+
+    if av_product.contains("sophos") {
+        if let Some(loading) = app.sophos_loading.get(&device.hostname) {
+            if *loading {
+                lines.push(Line::from(Span::styled(
+                    "Loading Sophos data...",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+        }
+
+        if let Some(endpoint) = app.sophos_endpoints.get(&device.hostname) {
+            lines.push(Line::from(vec![Span::styled(
+                "Product: Sophos Endpoint",
+                Style::default().add_modifier(Modifier::BOLD),
+            )]));
+
+            let health = endpoint
+                .health
+                .as_ref()
+                .and_then(|h| h.overall.as_ref())
+                .map(|s| s.as_str())
+                .unwrap_or("Unknown");
+
+            let health_color = match health.to_lowercase().as_str() {
+                "good" => Color::Green,
+                "bad" => Color::Red,
+                "suspicious" => Color::Yellow,
+                _ => Color::White,
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw("Health: "),
+                Span::styled(health, Style::default().fg(health_color)),
+            ]));
+
+            let isolated = endpoint
+                .isolation
+                .as_ref()
+                .and_then(|i| i.is_isolated)
+                .unwrap_or(false);
+
+            lines.push(Line::from(vec![
+                Span::raw("Isolation: "),
+                Span::styled(
+                    if isolated { "Isolated" } else { "Not Isolated" },
+                    if isolated {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(Color::Green)
+                    },
+                ),
+            ]));
+
+            if let Some(status) = app.scan_status.get(&device.hostname) {
+                lines.push(Line::from(vec![
+                    Span::raw("Scan Status: "),
+                    Span::styled(format!("{:?}", status), Style::default().fg(Color::Cyan)),
+                ]));
+            }
+        } else if lines.is_empty() {
+            lines.push(Line::from("Sophos data not available."));
+        }
+    } else if av_product.contains("datto") {
+        if let Some(loading) = app.datto_av_loading.get(&device.hostname) {
+            if *loading {
+                lines.push(Line::from(Span::styled(
+                    "Loading Datto AV data...",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+        }
+
+        if let Some(agent) = app.datto_av_agents.get(&device.hostname) {
+            lines.push(Line::from(vec![Span::styled(
+                "Product: Datto AV",
+                Style::default().add_modifier(Modifier::BOLD),
+            )]));
+
+            lines.push(Line::from(vec![
+                Span::raw("Agent Status: "),
+                Span::raw(agent.status.as_deref().unwrap_or("Unknown")),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("Version: "),
+                Span::raw(agent.version.as_deref().unwrap_or("Unknown")),
+            ]));
+
+            if let Some(status) = app.scan_status.get(&device.hostname) {
+                lines.push(Line::from(vec![
+                    Span::raw("Scan Status: "),
+                    Span::styled(format!("{:?}", status), Style::default().fg(Color::Cyan)),
+                ]));
+            }
+        } else if lines.is_empty() {
+            lines.push(Line::from("Datto AV data not available."));
+        }
+    } else {
+        lines.push(Line::from("No supported security product detected."));
+    }
+
+    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(p, area);
 }
 
 fn render_activity_detail(app: &mut App, frame: &mut Frame, area: Rect) {
