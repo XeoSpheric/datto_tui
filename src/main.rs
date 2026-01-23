@@ -1,5 +1,6 @@
 pub mod api;
 pub mod app;
+pub mod app_helpers;
 pub mod config;
 pub mod event;
 pub mod tui;

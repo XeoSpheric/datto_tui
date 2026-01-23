@@ -1,4 +1,4 @@
-use crate::api::datto::types::{DevicesResponse, SitesResponse};
+use crate::api::datto::types::{ActivityLogsResponse, DevicesResponse, JobResult, SitesResponse};
 use anyhow::Result;
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent, MouseEvent};
 use futures::{FutureExt, StreamExt};
@@ -39,6 +39,11 @@ pub enum Event {
         String,
         Result<Vec<crate::api::datto_av::types::Alert>, String>,
     ),
+    DattoAvPoliciesFetched(String, Result<serde_json::Value, String>),
+    ActivityLogsFetched(Result<ActivityLogsResponse, String>),
+    JobResultFetched(Result<JobResult, String>),
+    JobStdOutFetched(Result<Vec<crate::api::datto::types::JobStdOutput>, String>),
+    JobStdErrFetched(Result<Vec<crate::api::datto::types::JobStdOutput>, String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

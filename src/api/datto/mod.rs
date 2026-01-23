@@ -1,4 +1,6 @@
+pub mod activity;
 pub mod devices;
+pub mod jobs;
 pub mod sites;
 pub mod types;
 pub mod variables;

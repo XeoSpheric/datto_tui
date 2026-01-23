@@ -1,8 +1,12 @@
 use crate::api::datto::DattoClient;
+use crate::app_helpers::generate_job_rows;
+use crate::api::datto::activity::ActivityApi;
 use crate::api::datto::devices::DevicesApi;
+use crate::api::datto::jobs::JobsApi;
 use crate::api::datto::sites::SitesApi;
 use crate::api::datto::types::{
-    CreateVariableRequest, Device, Site, UpdateSiteRequest, UpdateVariableRequest,
+    ActivityLog, CreateVariableRequest, Device, JobResult, Site, UpdateSiteRequest,
+    UpdateVariableRequest,
 };
 use crate::api::datto::variables::VariablesApi;
 use crate::event::{Event, EventHandler};
@@ -30,6 +34,7 @@ pub enum CurrentView {
     List,
     Detail,
     DeviceDetail,
+    ActivityDetail,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -42,7 +47,6 @@ pub enum SiteDetailTab {
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum DeviceDetailTab {
     Variables,
-    Security,
     Jobs,
 }
 
@@ -120,6 +124,13 @@ impl Default for InputState {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub enum JobViewRow {
+    ComponentHeader(usize), // Component Index
+    StdOutLink(usize),      // Component Index
+    StdErrLink(usize),      // Component Index
+}
+
 #[derive(Debug)]
 pub struct App {
     pub should_quit: bool,
@@ -154,6 +165,25 @@ pub struct App {
     pub selected_device: Option<Device>,
     pub device_detail_tab: DeviceDetailTab,
 
+    // Activity Logs
+    pub activity_logs: Vec<ActivityLog>,
+    pub selected_activity_log: Option<ActivityLog>,
+    pub selected_job_result: Option<JobResult>,
+    pub job_result_loading: bool,
+    pub job_result_error: Option<String>,
+    pub activity_logs_loading: bool,
+    pub activity_logs_error: Option<String>,
+    pub activity_logs_table_state: TableState,
+
+    // Activity Detail State
+    pub selected_job_row_index: usize,
+
+    // Popup State
+    pub show_popup: bool,
+    pub popup_title: String,
+    pub popup_content: String,
+    pub popup_loading: bool,
+
     // Input
     pub input_state: InputState,
     pub variables_table_state: TableState,
@@ -175,6 +205,7 @@ pub struct App {
     pub datto_av_agents: HashMap<String, AgentDetail>, // Key: hostname
     pub datto_av_loading: HashMap<String, bool>,
     pub datto_av_alerts: HashMap<String, Vec<crate::api::datto_av::types::Alert>>, // Key: hostname
+    pub datto_av_policies: HashMap<String, serde_json::Value>, // Key: hostname
 
     // Scan Loading States
     pub scan_status: HashMap<String, crate::event::ScanStatus>, // Key: hostname
@@ -208,6 +239,23 @@ impl Default for App {
             detail_tab: SiteDetailTab::Devices,
             selected_device: None,
             device_detail_tab: DeviceDetailTab::Variables,
+
+            activity_logs: Vec::new(),
+            selected_activity_log: None,
+            selected_job_result: None,
+            job_result_loading: false,
+            job_result_error: None,
+            activity_logs_loading: false,
+            activity_logs_error: None,
+            activity_logs_table_state: TableState::default(),
+
+            selected_job_row_index: 0,
+
+            show_popup: false,
+            popup_title: String::new(),
+            popup_content: String::new(),
+            popup_loading: false,
+
             input_state: InputState::default(),
             variables_table_state: TableState::default(),
             site_edit_state: SiteEditState::default(),
@@ -219,6 +267,7 @@ impl Default for App {
             datto_av_agents: HashMap::new(),
             datto_av_loading: HashMap::new(),
             datto_av_alerts: HashMap::new(),
+            datto_av_policies: HashMap::new(),
             scan_status: HashMap::new(),
         }
     }
@@ -678,7 +727,9 @@ impl App {
                         }
 
                         // Fetch alerts for this agent
-                        self.fetch_datto_av_alerts(agent.id.clone(), hostname, tx.clone());
+                        self.fetch_datto_av_alerts(agent.id.clone(), hostname.clone(), tx.clone());
+                        // Fetch policies for this agent
+                        self.fetch_datto_av_policies(agent.id.clone(), hostname, tx.clone());
                     }
                     Err(e) => {
                         self.error = Some(format!(
@@ -724,6 +775,140 @@ impl App {
                     // Ignore error for now, or log it
                 }
             },
+            Event::DattoAvPoliciesFetched(hostname, result) => match result {
+                Ok(policies) => {
+                    // Log to debug.log
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("debug.log")
+                        .map(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, "Policies for {}: {:#?}", hostname, policies).unwrap();
+                        });
+                    self.datto_av_policies.insert(hostname, policies);
+                }
+                Err(e) => {
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("debug.log")
+                        .map(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, "Failed to fetch policies for {}: {}", hostname, e).unwrap();
+                        });
+                }
+            },
+            Event::ActivityLogsFetched(result) => {
+                self.activity_logs_loading = false;
+                match result {
+                    Ok(response) => {
+                        self.activity_logs = response.activities;
+                        if !self.activity_logs.is_empty() {
+                            self.activity_logs_table_state.select(Some(0));
+                        } else {
+                            self.activity_logs_table_state.select(None);
+                        }
+                    }
+                    Err(e) => {
+                        self.activity_logs_error = Some(e);
+                    }
+                }
+            }
+            Event::JobResultFetched(result) => {
+                self.job_result_loading = false;
+                match result {
+                    Ok(job_result) => {
+                        self.selected_job_result = Some(job_result);
+                    }
+                    Err(e) => {
+                        self.job_result_error = Some(e);
+                    }
+                }
+            }
+            Event::JobStdOutFetched(result) => {
+                self.popup_loading = false;
+                match result {
+                    Ok(outputs) => {
+                        // Find the output for the selected component (derived from selected row)
+                        if let Some(job_result) = &self.selected_job_result {
+                            let rows = generate_job_rows(job_result);
+                            if let Some(row) = rows.get(self.selected_job_row_index) {
+                                let comp_idx = match row {
+                                    JobViewRow::ComponentHeader(i)
+                                    | JobViewRow::StdOutLink(i)
+                                    | JobViewRow::StdErrLink(i) => *i,
+                                };
+
+                                if let Some(components) = &job_result.component_results {
+                                    if let Some(selected_comp) = components.get(comp_idx) {
+                                        if let Some(comp_uid) = &selected_comp.component_uid {
+                                            if let Some(output) = outputs
+                                                .iter()
+                                                .find(|o| o.component_uid.as_ref() == Some(comp_uid))
+                                            {
+                                                self.popup_content = output
+                                                    .std_data
+                                                    .clone()
+                                                    .unwrap_or_else(|| "No StdOut data".to_string());
+                                            } else {
+                                                self.popup_content =
+                                                    "No StdOut found for this component".to_string();
+                                            }
+                                        } else {
+                                            self.popup_content = "Component UID missing".to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.popup_content = format!("Error: {}", e);
+                    }
+                }
+            }
+            Event::JobStdErrFetched(result) => {
+                self.popup_loading = false;
+                match result {
+                    Ok(outputs) => {
+                        if let Some(job_result) = &self.selected_job_result {
+                            let rows = generate_job_rows(job_result);
+                            if let Some(row) = rows.get(self.selected_job_row_index) {
+                                let comp_idx = match row {
+                                    JobViewRow::ComponentHeader(i)
+                                    | JobViewRow::StdOutLink(i)
+                                    | JobViewRow::StdErrLink(i) => *i,
+                                };
+
+                                if let Some(components) = &job_result.component_results {
+                                    if let Some(selected_comp) = components.get(comp_idx) {
+                                        if let Some(comp_uid) = &selected_comp.component_uid {
+                                            if let Some(output) = outputs
+                                                .iter()
+                                                .find(|o| o.component_uid.as_ref() == Some(comp_uid))
+                                            {
+                                                self.popup_content = output
+                                                    .std_data
+                                                    .clone()
+                                                    .unwrap_or_else(|| "No StdErr data".to_string());
+                                            } else {
+                                                self.popup_content =
+                                                    "No StdErr found for this component".to_string();
+                                            }
+                                        } else {
+                                            self.popup_content = "Component UID missing".to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.popup_content = format!("Error: {}", e);
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -768,6 +953,125 @@ impl App {
                     .await
                     .map_err(|e| format!("{:#}", e));
                 tx.send(Event::DevicesFetched(result)).unwrap();
+            });
+        }
+    }
+
+    fn fetch_activity_logs(
+        &mut self,
+        _device_uid: String,
+        device_id: i32,
+        site_id: i32,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = &self.client {
+            self.activity_logs_loading = true;
+            self.activity_logs_error = None;
+            self.activity_logs.clear();
+
+            let client = client.clone();
+            tokio::spawn(async move {
+                // Calculate date range: last 24 hours
+                let now = chrono::Utc::now();
+                let yesterday = now - chrono::Duration::days(1);
+                let from_str = yesterday.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                let until_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+                // Since we cannot filter by device UID directly in the API for this endpoint (based on error message),
+                // we filter by site_id and "device" entity type, then filter in memory for the specific device ID.
+                let result = client
+                    .get_activity_logs(
+                        None,                                  // Page (None = empty/first)
+                        100,                                   // Size (Increase to likely catch the device activity)
+                        Some("desc".to_string()),              // Order
+                        Some(from_str),                        // From (Last 24h)
+                        Some(until_str),                       // Until (Now)
+                        Some(vec!["device".to_string()]),      // Entities: "device" literal
+                        None,                                  // Categories
+                        None,                                  // Actions
+                        Some(vec![site_id]),                   // SiteIds
+                        None,                                  // UserIds
+                    )
+                    .await
+                    .map(|mut response| {
+                        // Client-side filtering for the specific device
+                        response.activities.retain(|log| {
+                            log.device_id == Some(device_id)
+                        });
+                        response
+                    })
+                    .map_err(|e| e.to_string());
+
+                tx.send(Event::ActivityLogsFetched(result)).unwrap();
+            });
+        }
+    }
+
+    fn fetch_job_result(
+        &mut self,
+        job_uid: String,
+        device_uid: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = &self.client {
+            self.job_result_loading = true;
+            self.job_result_error = None;
+            self.selected_job_result = None;
+            self.selected_job_row_index = 0; // Reset index
+
+            let client = client.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .get_job_result(&job_uid, &device_uid)
+                    .await
+                    .map_err(|e| e.to_string());
+                tx.send(Event::JobResultFetched(result)).unwrap();
+            });
+        }
+    }
+
+    fn fetch_job_stdout(
+        &mut self,
+        job_uid: String,
+        device_uid: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = &self.client {
+            self.popup_loading = true;
+            self.show_popup = true;
+            self.popup_title = "StdOut".to_string();
+            self.popup_content = "Loading...".to_string();
+
+            let client = client.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .get_job_stdout(&job_uid, &device_uid)
+                    .await
+                    .map_err(|e| e.to_string());
+                tx.send(Event::JobStdOutFetched(result)).unwrap();
+            });
+        }
+    }
+
+    fn fetch_job_stderr(
+        &mut self,
+        job_uid: String,
+        device_uid: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = &self.client {
+            self.popup_loading = true;
+            self.show_popup = true;
+            self.popup_title = "StdErr".to_string();
+            self.popup_content = "Loading...".to_string();
+
+            let client = client.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .get_job_stderr(&job_uid, &device_uid)
+                    .await
+                    .map_err(|e| e.to_string());
+                tx.send(Event::JobStdErrFetched(result)).unwrap();
             });
         }
     }
@@ -929,6 +1233,26 @@ impl App {
         }
     }
 
+    fn fetch_datto_av_policies(
+        &self,
+        agent_id: String,
+        hostname: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = &self.datto_av_client {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .get_agent_policies(&agent_id)
+                    .await
+                    .map_err(|e| e.to_string());
+                tx.send(Event::DattoAvPoliciesFetched(hostname, result))
+                    .unwrap();
+            });
+        }
+    }
+
+    #[allow(dead_code)]
     fn scan_datto_av_agent(
         &mut self,
         agent_id: String,
@@ -950,6 +1274,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn scan_sophos_endpoint(
         &mut self,
         endpoint_id: String,
@@ -1114,9 +1439,69 @@ impl App {
                 // Determine context based on tab
                 KeyCode::Enter if self.detail_tab == SiteDetailTab::Devices => {
                     if let Some(idx) = self.devices_table_state.selected() {
-                        if let Some(device) = self.devices.get(idx) {
+                        // Clone device to release borrow on self.devices
+                        let device_clone = self.devices.get(idx).cloned();
+
+                        if let Some(device) = device_clone {
                             self.selected_device = Some(device.clone());
                             self.current_view = CurrentView::DeviceDetail;
+
+                            // Auto-load Security Data
+                            let is_sophos = device
+                                .antivirus
+                                .as_ref()
+                                .and_then(|av| av.antivirus_product.as_ref())
+                                .map(|prod| prod.to_lowercase().contains("sophos"))
+                                .unwrap_or(false);
+
+                            let is_datto = device
+                                .antivirus
+                                .as_ref()
+                                .and_then(|av| av.antivirus_product.as_ref())
+                                .map(|prod| prod.to_lowercase().contains("datto"))
+                                .unwrap_or(false);
+
+                            if is_sophos {
+                                // Find site variables for tuiMdrId
+                                let sophos_params = if let Some(site) =
+                                    self.sites.iter().find(|s| s.uid == device.site_uid)
+                                {
+                                    if let Some(vars) = &site.variables {
+                                        if let Some(id_var) =
+                                            vars.iter().find(|v| v.name == "tuiMdrId")
+                                        {
+                                            let region = vars
+                                                .iter()
+                                                .find(|v| v.name == "tuiMdrRegion")
+                                                .map(|v| v.value.clone());
+                                            Some((id_var.value.clone(), region))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                if let Some((id, region)) = sophos_params {
+                                    self.fetch_sophos_endpoint(
+                                        id,
+                                        region,
+                                        device.hostname.clone(),
+                                        tx.clone(),
+                                    );
+                                }
+                            }
+
+                            if is_datto {
+                                self.fetch_datto_av_agent(
+                                    device.hostname.clone(),
+                                    device.udf.clone(),
+                                    tx.clone(),
+                                );
+                            }
                         }
                     }
                 }
@@ -1177,126 +1562,47 @@ impl App {
                 }
                 KeyCode::Tab => {
                     self.device_detail_tab = match self.device_detail_tab {
-                        DeviceDetailTab::Variables => DeviceDetailTab::Security,
-                        DeviceDetailTab::Security => DeviceDetailTab::Jobs,
-                        DeviceDetailTab::Jobs => DeviceDetailTab::Variables,
-                    };
-
-                    if self.device_detail_tab == DeviceDetailTab::Security {
-                        let fetch_data = if let Some(device) = &self.selected_device {
-                            let is_sophos = device
-                                .antivirus
-                                .as_ref()
-                                .and_then(|av| av.antivirus_product.as_ref())
-                                .map(|prod| prod.to_lowercase().contains("sophos"))
-                                .unwrap_or(false);
-
-                            let is_datto = device
-                                .antivirus
-                                .as_ref()
-                                .and_then(|av| av.antivirus_product.as_ref())
-                                .map(|prod| prod.to_lowercase().contains("datto"))
-                                .unwrap_or(false);
-
-                            Some((
-                                is_sophos,
-                                is_datto,
-                                device.site_uid.clone(),
-                                device.hostname.clone(),
-                                device.udf.clone(),
-                            ))
-                        } else {
-                            None
-                        };
-
-                        if let Some((is_sophos, is_datto, site_uid, hostname, udf)) = fetch_data {
-                            if is_sophos {
-                                // Find site variables for tuiMdrId
-                                let sophos_params = if let Some(site) =
-                                    self.sites.iter().find(|s| s.uid == site_uid)
-                                {
-                                    if let Some(vars) = &site.variables {
-                                        if let Some(id_var) =
-                                            vars.iter().find(|v| v.name == "tuiMdrId")
-                                        {
-                                            let region = vars
-                                                .iter()
-                                                .find(|v| v.name == "tuiMdrRegion")
-                                                .map(|v| v.value.clone());
-                                            Some((id_var.value.clone(), region))
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                if let Some((id, region)) = sophos_params {
-                                    self.fetch_sophos_endpoint(
-                                        id,
-                                        region,
-                                        hostname.clone(),
-                                        tx.clone(),
-                                    );
-                                }
-                            }
-
-                            if is_datto {
-                                self.fetch_datto_av_agent(hostname, udf, tx.clone());
-                            }
-                        }
-                    }
-                }
-                KeyCode::Char('s') if self.device_detail_tab == DeviceDetailTab::Security => {
-                    // Check if we have an endpoint ID
-                    if let Some(device) = &self.selected_device {
-                        // Prevent spamming
-                        if self.scan_status.contains_key(&device.hostname) {
-                            return;
-                        }
-
-                        let mut endpoint_id = None;
-                        // First check UDF30
-                        if let Some(udf) = &device.udf {
-                            if let Some(id) = &udf.udf30 {
-                                if !id.is_empty() {
-                                    endpoint_id = Some(id.clone());
-                                }
-                            }
-                        }
-                        // Then check fetched endpoints
-                        if endpoint_id.is_none() {
-                            if let Some(endpoint) = self.sophos_endpoints.get(&device.hostname) {
-                                endpoint_id = Some(endpoint.id.clone());
-                            }
-                        }
-
-                        if let Some(id) = endpoint_id {
-                            let is_sophos = device
-                                .antivirus
-                                .as_ref()
-                                .and_then(|av| av.antivirus_product.as_ref())
-                                .map(|prod| prod.to_lowercase().contains("sophos"))
-                                .unwrap_or(false);
-
-                            let is_datto = device
-                                .antivirus
-                                .as_ref()
-                                .and_then(|av| av.antivirus_product.as_ref())
-                                .map(|prod| prod.to_lowercase().contains("datto"))
-                                .unwrap_or(false);
-
-                            if is_sophos {
-                                self.scan_sophos_endpoint(
-                                    id.clone(),
-                                    device.hostname.clone(),
+                        DeviceDetailTab::Variables => {
+                            if let Some(device) = &self.selected_device {
+                                self.fetch_activity_logs(
+                                    device.uid.clone(),
+                                    device.id,
+                                    device.site_id,
                                     tx.clone(),
                                 );
-                            } else if is_datto {
-                                self.scan_datto_av_agent(id, device.hostname.clone(), tx.clone());
+                            }
+                            DeviceDetailTab::Jobs
+                        }
+                        DeviceDetailTab::Jobs => DeviceDetailTab::Variables,
+                    };
+                }
+                KeyCode::Char('j') | KeyCode::Down
+                    if self.device_detail_tab == DeviceDetailTab::Jobs =>
+                {
+                    self.next_activity_log();
+                }
+                KeyCode::Char('k') | KeyCode::Up
+                    if self.device_detail_tab == DeviceDetailTab::Jobs =>
+                {
+                    self.prev_activity_log();
+                }
+                KeyCode::Enter | KeyCode::Char(' ')
+                    if self.device_detail_tab == DeviceDetailTab::Jobs =>
+                {
+                    if let Some(idx) = self.activity_logs_table_state.selected() {
+                        if let Some(log) = self.activity_logs.get(idx) {
+                            self.selected_activity_log = Some(log.clone());
+                            self.current_view = CurrentView::ActivityDetail;
+
+                            // Parse job ID from details and fetch job result
+                            if let Some(details) = &log.details {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(details) {
+                                    if let Some(job_uid) = parsed.get("job.uid").and_then(|v| v.as_str()) {
+                                        if let Some(device) = &self.selected_device {
+                                            self.fetch_job_result(job_uid.to_string(), device.uid.clone(), tx.clone());
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1338,6 +1644,118 @@ impl App {
                 }
                 _ => {}
             },
+            CurrentView::ActivityDetail => {
+                if self.show_popup {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            self.show_popup = false;
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.current_view = CurrentView::DeviceDetail;
+                        self.selected_activity_log = None;
+                        self.selected_job_result = None;
+                        self.job_result_error = None;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if let Some(job_result) = &self.selected_job_result {
+                            let rows = generate_job_rows(job_result);
+                            if !rows.is_empty() && self.selected_job_row_index < rows.len() - 1 {
+                                self.selected_job_row_index += 1;
+                            }
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if self.selected_job_row_index > 0 {
+                            self.selected_job_row_index -= 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(job_result) = &self.selected_job_result {
+                            let rows = generate_job_rows(job_result);
+                            if let Some(row) = rows.get(self.selected_job_row_index) {
+                                match row {
+                                    JobViewRow::StdOutLink(_) => {
+                                        if let Some(job_uid) = &job_result.job_uid {
+                                            if let Some(device_uid) = &job_result.device_uid {
+                                                self.fetch_job_stdout(
+                                                    job_uid.clone(),
+                                                    device_uid.clone(),
+                                                    tx.clone(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    JobViewRow::StdErrLink(_) => {
+                                        if let Some(job_uid) = &job_result.job_uid {
+                                            if let Some(device_uid) = &job_result.device_uid {
+                                                self.fetch_job_stderr(
+                                                    job_uid.clone(),
+                                                    device_uid.clone(),
+                                                    tx.clone(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    _ => {} // Do nothing for header selection
+                                }
+                            }
+                        }
+                    }
+                    // Shortcuts still work
+                    KeyCode::Char('o') => {
+                        if let Some(job_result) = &self.selected_job_result {
+                            let rows = generate_job_rows(job_result);
+                            // Need to find component index from row index if possible or just use current selection context if we were selecting components?
+                            // With row selection, 'o' might be ambiguous if we are on a row that isn't the component.
+                            // But usually shortcuts operate on the "current item".
+                            // Let's make 'o' try to open stdout for the *current row's component*.
+                            if let Some(row) = rows.get(self.selected_job_row_index) {
+                                let comp_idx = match row {
+                                    JobViewRow::ComponentHeader(i) | JobViewRow::StdOutLink(i) | JobViewRow::StdErrLink(i) => *i
+                                };
+                                // Check if this component actually HAS stdout before fetching?
+                                // The API call will fail or return empty if not, but UI shows flag.
+                                // Let's just try fetching.
+                                if let Some(job_uid) = &job_result.job_uid {
+                                    if let Some(device_uid) = &job_result.device_uid {
+                                         self.fetch_job_stdout(
+                                            job_uid.clone(),
+                                            device_uid.clone(),
+                                            tx.clone(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('e') => {
+                        if let Some(job_result) = &self.selected_job_result {
+                             let rows = generate_job_rows(job_result);
+                             if let Some(row) = rows.get(self.selected_job_row_index) {
+                                // let comp_idx = match row {
+                                //     JobViewRow::ComponentHeader(i) | JobViewRow::StdOutLink(i) | JobViewRow::StdErrLink(i) => *i
+                                // };
+                                if let Some(job_uid) = &job_result.job_uid {
+                                    if let Some(device_uid) = &job_result.device_uid {
+                                         self.fetch_job_stderr(
+                                            job_uid.clone(),
+                                            device_uid.clone(),
+                                            tx.clone(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1824,5 +2242,33 @@ impl App {
                 self.selected_device = Some(device); // Restore
             }
         }
+    }
+
+    fn next_activity_log(&mut self) {
+        let i = match self.activity_logs_table_state.selected() {
+            Some(i) => {
+                if i >= self.activity_logs.len().saturating_sub(1) {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.activity_logs_table_state.select(Some(i));
+    }
+
+    fn prev_activity_log(&mut self) {
+        let i = match self.activity_logs_table_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.activity_logs.len().saturating_sub(1)
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.activity_logs_table_state.select(Some(i));
     }
 }

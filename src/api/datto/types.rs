@@ -220,3 +220,73 @@ pub struct SitesResponse {
     pub page_details: PageDetails,
     pub sites: Vec<Site>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySite {
+    pub id: i32,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityUser {
+    pub id: i32,
+    pub user_name: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityLog {
+    pub id: Option<String>,
+    pub entity: Option<String>,
+    pub category: Option<String>,
+    pub action: Option<String>,
+    pub date: Option<f64>,
+    pub site: Option<ActivitySite>,
+    pub device_id: Option<i32>,
+    pub hostname: Option<String>,
+    pub user: Option<ActivityUser>,
+    pub details: Option<String>,
+    pub has_std_out: Option<bool>,
+    pub has_std_err: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityLogsResponse {
+    pub page_details: Option<PageDetails>,
+    pub activities: Vec<ActivityLog>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentResult {
+    pub component_uid: Option<String>,
+    pub component_name: Option<String>,
+    pub component_status: Option<String>,
+    pub number_of_warnings: Option<i32>,
+    pub has_std_out: Option<bool>,
+    pub has_std_err: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct JobResult {
+    pub job_uid: Option<String>,
+    pub device_uid: Option<String>,
+    pub ran_on: Option<serde_json::Value>, // Changed to Value to accept number or string
+    pub job_deployment_status: Option<String>,
+    pub component_results: Option<Vec<ComponentResult>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct JobStdOutput {
+    pub component_uid: Option<String>,
+    pub component_name: Option<String>,
+    pub std_data: Option<String>,
+}

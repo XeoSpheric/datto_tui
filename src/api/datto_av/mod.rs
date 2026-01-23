@@ -154,4 +154,30 @@ impl DattoAvClient {
 
         Ok(alerts)
     }
+
+    pub async fn get_agent_policies(&self, agent_id: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/Agents/{}/getAgentPolicies", self.config.url, agent_id);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("{}", self.config.secret))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("Failed to send get_agent_policies request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Get agent policies failed: {} - {}", status, text);
+        }
+
+        let policies = response
+            .json::<serde_json::Value>()
+            .await
+            .context("Failed to parse agent policies response")?;
+
+        Ok(policies)
+    }
 }

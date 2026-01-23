@@ -1,4 +1,7 @@
-use crate::app::{App, CurrentView, DeviceDetailTab, InputField, InputMode, SiteDetailTab};
+use crate::app::{
+    App, CurrentView, DeviceDetailTab, InputField, InputMode, JobViewRow, SiteDetailTab,
+};
+use crate::app_helpers::generate_job_rows;
 use chrono::{DateTime, Local};
 use ratatui::{
     prelude::*,
@@ -21,6 +24,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         }
         CurrentView::Detail => "Detail View | 'Esc'/'q': back".to_string(),
         CurrentView::DeviceDetail => "Device Detail | 'Esc'/'q': back".to_string(),
+        CurrentView::ActivityDetail => "Activity Detail | 'Esc'/'q': back".to_string(),
     };
 
     frame.render_widget(
@@ -50,6 +54,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             CurrentView::List => render_list(app, frame, layout[1], main_block),
             CurrentView::Detail => render_detail(app, frame, layout[1]),
             CurrentView::DeviceDetail => render_device_detail(app, frame, layout[1]),
+            CurrentView::ActivityDetail => render_activity_detail(app, frame, layout[1]),
         }
     }
 
@@ -57,6 +62,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if app.input_state.mode == InputMode::Editing {
         render_input_modal(app, frame);
     }
+
+    // Render Popup
+    render_popup(app, frame);
 }
 
 fn render_list(app: &mut App, frame: &mut Frame, area: Rect, block: Block) {
@@ -567,11 +575,10 @@ fn render_device_detail(app: &mut App, frame: &mut Frame, area: Rect) {
             .constraints([Constraint::Length(3), Constraint::Min(0)])
             .split(chunks[1]);
 
-        let tabs = Tabs::new(vec!["Variables", "Security", "Jobs"])
+        let tabs = Tabs::new(vec!["Variables", "Jobs"])
             .select(match app.device_detail_tab {
                 DeviceDetailTab::Variables => 0,
-                DeviceDetailTab::Security => 1,
-                DeviceDetailTab::Jobs => 2,
+                DeviceDetailTab::Jobs => 1,
             })
             .block(Block::default().borders(Borders::ALL).title("Tabs"))
             .highlight_style(
@@ -585,10 +592,7 @@ fn render_device_detail(app: &mut App, frame: &mut Frame, area: Rect) {
             DeviceDetailTab::Variables => {
                 render_device_variables(device, frame, right_chunks[1], &mut app.udf_table_state)
             }
-            DeviceDetailTab::Security => {
-                render_device_security(app, device, frame, right_chunks[1])
-            }
-            DeviceDetailTab::Jobs => render_device_jobs(device, frame, right_chunks[1]),
+            DeviceDetailTab::Jobs => render_device_jobs(app, frame, right_chunks[1]),
         }
     } else {
         frame.render_widget(
@@ -1073,8 +1077,469 @@ fn render_device_security(
     frame.render_widget(p, area);
 }
 
-fn render_device_jobs(_device: &crate::api::datto::types::Device, frame: &mut Frame, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title("Jobs");
-    let p = Paragraph::new("Jobs functionality coming soon...").block(block);
-    frame.render_widget(p, area);
+fn render_device_jobs(app: &mut App, frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Activity Logs (Jobs)");
+
+    if app.activity_logs_loading {
+        frame.render_widget(Paragraph::new("Loading logs...").block(block), area);
+        return;
+    }
+
+    if let Some(err) = &app.activity_logs_error {
+        frame.render_widget(
+            Paragraph::new(format!("Error: {}", err))
+                .style(Style::default().fg(Color::Red))
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    if app.activity_logs.is_empty() {
+        frame.render_widget(Paragraph::new("No activity logs found.").block(block), area);
+        return;
+    }
+
+    let rows: Vec<Row> = app
+        .activity_logs
+        .iter()
+        .enumerate()
+        .map(|(i, log)| {
+            let style = if Some(i) == app.activity_logs_table_state.selected() {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+
+            // Convert date (f64 timestamp) to readable string
+            // Assuming date is in seconds.millis format (e.g. 1689072497.714)
+            let date_str = if let Some(ts) = log.date {
+                let seconds = ts as i64;
+                let nanos = ((ts - seconds as f64) * 1_000_000_000.0) as u32;
+                if let Some(dt) = DateTime::from_timestamp(seconds, nanos) {
+                    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                } else {
+                    ts.to_string()
+                }
+            } else {
+                "N/A".to_string()
+            };
+
+            let user_name = log
+                .user
+                .as_ref()
+                .and_then(|u| u.user_name.clone())
+                .unwrap_or_else(|| "System".to_string());
+
+            // Parse Details JSON if possible to extract Job Name and Status
+            let mut job_status = String::new();
+            let mut job_name = log.details.clone().unwrap_or_default();
+
+            if let Some(details_json) = &log.details {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(details_json) {
+                    if let Some(status) = parsed.get("job.status").and_then(|s| s.as_str()) {
+                        job_status = status.to_string();
+                    }
+                    if let Some(name) = parsed.get("job.name").and_then(|s| s.as_str()) {
+                        job_name = name.to_string();
+                    }
+                }
+            }
+
+            let status_style = match job_status.to_lowercase().as_str() {
+                "expired" => Style::default().fg(Color::Rgb(255, 165, 0)), // Orange
+                "scheduled" => Style::default().fg(Color::Blue),
+                "running" => Style::default().fg(Color::Cyan),
+                "success" => Style::default().fg(Color::Green),
+                "warning" => Style::default().fg(Color::Rgb(255, 165, 0)), // Orange
+                "failure" => Style::default().fg(Color::Red),
+                _ => Style::default(),
+            };
+
+            Row::new(vec![
+                Cell::from(date_str),
+                Cell::from(job_name), // Display Job Name instead of raw details
+                Cell::from(Span::styled(job_status, status_style)), // Display Status
+                Cell::from(log.action.as_deref().unwrap_or("")),
+                Cell::from(log.category.as_deref().unwrap_or("")),
+                Cell::from(user_name),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(22),     // Time
+            Constraint::Percentage(40), // Job Name (was Details)
+            Constraint::Length(12),     // Status
+            Constraint::Length(15),     // Action
+            Constraint::Length(10),     // Category
+            Constraint::Length(15),     // User
+        ],
+    )
+    .header(
+        Row::new(vec![
+            "Time", "Job Name", "Status", "Action", "Category", "User",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(block)
+    .highlight_symbol(">> ");
+
+    frame.render_stateful_widget(table, area, &mut app.activity_logs_table_state);
+}
+
+fn render_activity_detail(app: &mut App, frame: &mut Frame, area: Rect) {
+    if let Some(log) = &app.selected_activity_log {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Activity Log Details");
+
+        // Format date
+        let date_str = if let Some(ts) = log.date {
+            let seconds = ts as i64;
+            let nanos = ((ts - seconds as f64) * 1_000_000_000.0) as u32;
+            if let Some(dt) = DateTime::from_timestamp(seconds, nanos) {
+                dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+            } else {
+                ts.to_string()
+            }
+        } else {
+            "N/A".to_string()
+        };
+
+        let user_name = log
+            .user
+            .as_ref()
+            .and_then(|u| u.user_name.clone())
+            .unwrap_or_else(|| "System".to_string());
+
+        let site_name = log
+            .site
+            .as_ref()
+            .and_then(|s| s.name.clone())
+            .unwrap_or_else(|| "Unknown Site".to_string());
+
+        // Parse Details JSON
+        let mut job_status = String::new();
+        let mut job_name = String::new();
+        let mut extra_details = Vec::new();
+
+        if let Some(details_json) = &log.details {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(details_json) {
+                if let Some(obj) = parsed.as_object() {
+                    for (k, v) in obj {
+                        if k == "job.status" {
+                            job_status = v.as_str().unwrap_or("").to_string();
+                        } else if k == "job.name" {
+                            job_name = v.as_str().unwrap_or("").to_string();
+                        } else {
+                            // Format other keys nicely
+                            let val_str = if let Some(s) = v.as_str() {
+                                s.to_string()
+                            } else {
+                                v.to_string()
+                            };
+                            extra_details.push((k.clone(), val_str));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort extra details for consistent display
+        extra_details.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let status_style = match job_status.to_lowercase().as_str() {
+            "expired" => Style::default().fg(Color::Rgb(255, 165, 0)), // Orange
+            "scheduled" => Style::default().fg(Color::Blue),
+            "running" => Style::default().fg(Color::Cyan),
+            "success" => Style::default().fg(Color::Green),
+            "warning" => Style::default().fg(Color::Rgb(255, 165, 0)), // Orange
+            "failure" => Style::default().fg(Color::Red),
+            _ => Style::default(),
+        };
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Time: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(date_str),
+            ]),
+            Line::from(vec![
+                Span::styled("Job Name: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(if !job_name.is_empty() {
+                    job_name.clone()
+                } else {
+                    "N/A".to_string()
+                }),
+            ]),
+            Line::from(vec![
+                Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    if !job_status.is_empty() {
+                        job_status
+                    } else {
+                        "N/A".to_string()
+                    },
+                    status_style,
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Action: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(log.action.as_deref().unwrap_or("N/A")),
+            ]),
+            Line::from(vec![
+                Span::styled("Category: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(log.category.as_deref().unwrap_or("N/A")),
+            ]),
+            Line::from(vec![
+                Span::styled("User: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(user_name),
+            ]),
+            Line::from(vec![
+                Span::styled("Entity: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(log.entity.as_deref().unwrap_or("N/A")),
+            ]),
+            Line::from(vec![
+                Span::styled("Hostname: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(log.hostname.as_deref().unwrap_or("N/A")),
+            ]),
+            Line::from(vec![
+                Span::styled("Site: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(site_name),
+            ]),
+            Line::from(""),
+        ];
+
+        // Job Results Section
+        if app.job_result_loading {
+            lines.push(Line::from(Span::styled(
+                "Loading Job Results...",
+                Style::default().fg(Color::Yellow),
+            )));
+        } else if let Some(err) = &app.job_result_error {
+            lines.push(Line::from(Span::styled(
+                format!("Error fetching job results: {}", err),
+                Style::default().fg(Color::Red),
+            )));
+        } else if let Some(job_result) = &app.selected_job_result {
+            lines.push(Line::from(Span::styled(
+                "Job Results:",
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )));
+
+            let status = job_result.job_deployment_status.as_deref().unwrap_or("N/A");
+            let deployment_status_color = match status.to_lowercase().as_str() {
+                "success" => Color::Green,
+                "failure" | "error" => Color::Red,
+                "warning" | "expired" => Color::Rgb(255, 165, 0), // Orange
+                "scheduled" => Color::Blue,
+                "running" => Color::Cyan,
+                _ => Color::White,
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Deployment Status: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(status, Style::default().fg(deployment_status_color)),
+            ]));
+            let ran_on_str = match &job_result.ran_on {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Number(n)) => {
+                    if let Some(ts) = n.as_i64() {
+                        let seconds = ts / 1000;
+                        let nanos = ((ts % 1000) * 1_000_000) as u32;
+                        if let Some(dt) = DateTime::from_timestamp(seconds, i64::from(nanos) as u32)
+                        {
+                            dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+                        } else {
+                            ts.to_string()
+                        }
+                    } else if let Some(f) = n.as_f64() {
+                        let seconds = f as i64;
+                        // Assuming seconds.fraction if float, or milliseconds?
+                        // If it's like 1.7e12, it's millis. If 1.7e9, it's seconds.
+                        // The example 1769126162000 is millis.
+                        if f > 10_000_000_000.0 {
+                            // Milliseconds
+                            let seconds = (f / 1000.0) as i64;
+                            let nanos = ((f % 1000.0) * 1_000_000.0) as u32;
+                            if let Some(dt) = DateTime::from_timestamp(seconds, nanos) {
+                                dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+                            } else {
+                                f.to_string()
+                            }
+                        } else {
+                            // Seconds
+                            let seconds = f as i64;
+                            let nanos = ((f - seconds as f64) * 1_000_000_000.0) as u32;
+                            if let Some(dt) = DateTime::from_timestamp(seconds, nanos) {
+                                dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+                            } else {
+                                f.to_string()
+                            }
+                        }
+                    } else {
+                        n.to_string()
+                    }
+                }
+                _ => "N/A".to_string(),
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled("Ran On: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(ran_on_str),
+            ]));
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Components:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+
+            if let Some(components) = &job_result.component_results {
+                let rows = generate_job_rows(job_result);
+                // We need to match displayed lines to rows.
+                // iterate rows and render.
+
+                for (row_index, row) in rows.iter().enumerate() {
+                    let is_selected = row_index == app.selected_job_row_index;
+                    let style = if is_selected {
+                        Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    };
+
+                    match row {
+                        JobViewRow::ComponentHeader(idx) => {
+                            if let Some(comp) = components.get(*idx) {
+                                let status_color = match comp
+                                    .component_status
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .to_lowercase()
+                                    .as_str()
+                                {
+                                    "success" => Color::Green,
+                                    "failure" | "error" => Color::Red,
+                                    "warning" => Color::Yellow,
+                                    _ => Color::White,
+                                };
+
+                                let prefix = if is_selected { "> " } else { "- " };
+
+                                // Component Name Line
+                                lines.push(Line::from(vec![
+                                    Span::styled(prefix, style),
+                                    Span::styled(
+                                        comp.component_name
+                                            .as_deref()
+                                            .unwrap_or("Unknown Component"),
+                                        style.add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::raw(": "),
+                                    Span::styled(
+                                        comp.component_status.as_deref().unwrap_or("N/A"),
+                                        if is_selected {
+                                            style
+                                        } else {
+                                            Style::default().fg(status_color)
+                                        },
+                                    ),
+                                ]));
+
+                                // Warnings (indented)
+                                if let Some(warnings) = comp.number_of_warnings {
+                                    if warnings > 0 {
+                                        lines.push(Line::from(vec![
+                                            Span::raw("    Warnings: "),
+                                            Span::styled(
+                                                warnings.to_string(),
+                                                Style::default().fg(Color::Yellow),
+                                            ),
+                                        ]));
+                                    }
+                                }
+                            }
+                        }
+                        JobViewRow::StdOutLink(_) => {
+                            lines.push(Line::from(vec![
+                                Span::raw("    "),
+                                Span::styled(
+                                    "View Standard Output",
+                                    if is_selected {
+                                        style.fg(Color::Cyan)
+                                    } else {
+                                        Style::default().fg(Color::Cyan)
+                                    },
+                                ),
+                            ]));
+                        }
+                        JobViewRow::StdErrLink(_) => {
+                            lines.push(Line::from(vec![
+                                Span::raw("    "),
+                                Span::styled(
+                                    "View Standard Error",
+                                    if is_selected {
+                                        style.fg(Color::Red)
+                                    } else {
+                                        Style::default().fg(Color::Red)
+                                    },
+                                ),
+                            ]));
+                        }
+                    }
+                }
+            } else {
+                lines.push(Line::from("No components found."));
+            }
+        } else {
+            // Only show this if we aren't loading and don't have a result yet (e.g. no job UID found)
+            lines.push(Line::from(Span::styled(
+                "No Job Result information available.",
+                Style::default().fg(Color::Gray),
+            )));
+        }
+
+        let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+        frame.render_widget(p, area);
+    } else {
+        frame.render_widget(
+            Paragraph::new("No activity log selected")
+                .block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+    }
+}
+
+fn render_popup(app: &App, frame: &mut Frame) {
+    if app.show_popup {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(app.popup_title.as_str());
+        let area = centered_rect(60, 60, frame.area());
+
+        frame.render_widget(Clear, area); // Clear the area below the popup
+
+        if app.popup_loading {
+            frame.render_widget(
+                Paragraph::new("Loading...")
+                    .block(block)
+                    .alignment(Alignment::Center),
+                area,
+            );
+        } else {
+            let p = Paragraph::new(app.popup_content.as_str())
+                .block(block)
+                .wrap(Wrap { trim: true })
+                .scroll((0, 0)); // TODO: Add scrolling state for popup if content is long
+            frame.render_widget(p, area);
+        }
+    }
 }
