@@ -1816,52 +1816,6 @@ impl App {
                             }
                         }
                     }
-                    // Shortcuts still work
-                    KeyCode::Char('o') => {
-                        if let Some(job_result) = &self.selected_job_result {
-                            let rows = generate_job_rows(job_result);
-                            // Need to find component index from row index if possible or just use current selection context if we were selecting components?
-                            // With row selection, 'o' might be ambiguous if we are on a row that isn't the component.
-                            // But usually shortcuts operate on the "current item".
-                            // Let's make 'o' try to open stdout for the *current row's component*.
-                            if let Some(row) = rows.get(self.selected_job_row_index) {
-                                let comp_idx = match row {
-                                    JobViewRow::ComponentHeader(i) | JobViewRow::StdOutLink(i) | JobViewRow::StdErrLink(i) => *i
-                                };
-                                // Check if this component actually HAS stdout before fetching?
-                                // The API call will fail or return empty if not, but UI shows flag.
-                                // Let's just try fetching.
-                                if let Some(job_uid) = &job_result.job_uid {
-                                    if let Some(device_uid) = &job_result.device_uid {
-                                         self.fetch_job_stdout(
-                                            job_uid.clone(),
-                                            device_uid.clone(),
-                                            tx.clone(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char('e') => {
-                        if let Some(job_result) = &self.selected_job_result {
-                             let rows = generate_job_rows(job_result);
-                             if let Some(row) = rows.get(self.selected_job_row_index) {
-                                // let comp_idx = match row {
-                                //     JobViewRow::ComponentHeader(i) | JobViewRow::StdOutLink(i) | JobViewRow::StdErrLink(i) => *i
-                                // };
-                                if let Some(job_uid) = &job_result.job_uid {
-                                    if let Some(device_uid) = &job_result.device_uid {
-                                         self.fetch_job_stderr(
-                                            job_uid.clone(),
-                                            device_uid.clone(),
-                                            tx.clone(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
                     _ => {}
                 }
             }
