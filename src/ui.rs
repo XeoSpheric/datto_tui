@@ -662,23 +662,16 @@ fn render_device_info(device: &crate::api::datto::types::Device, frame: &mut Fra
             Span::raw(device.operating_system.as_deref().unwrap_or("Unknown")),
         ]),
         Line::from(vec![
-            Span::styled(
-                "Display Version: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(device.display_version.as_deref().unwrap_or("N/A")),
-        ]),
-        Line::from(vec![
             Span::styled("Last User: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(device.last_logged_in_user.as_deref().unwrap_or("N/A")),
         ]),
         Line::from(vec![
-            Span::styled("Int. IP: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(device.int_ip_address.as_deref().unwrap_or("N/A")),
-        ]),
-        Line::from(vec![
-            Span::styled("Ext. IP: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(device.ext_ip_address.as_deref().unwrap_or("N/A")),
+            Span::styled("IP: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "{} | {}",
+                device.int_ip_address.as_deref().unwrap_or("N/A"),
+                device.ext_ip_address.as_deref().unwrap_or("N/A")
+            )),
         ]),
         Line::from(vec![
             Span::styled("Domain: ", Style::default().add_modifier(Modifier::BOLD)),
