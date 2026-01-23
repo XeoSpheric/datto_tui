@@ -209,6 +209,16 @@ pub struct App {
 
     // Scan Loading States
     pub scan_status: HashMap<String, crate::event::ScanStatus>, // Key: hostname
+
+    // Device Search Popup
+    pub show_device_search: bool,
+    pub device_search_query: String,
+    pub device_search_results: Vec<Device>,
+    pub device_search_loading: bool,
+    pub device_search_error: Option<String>,
+    pub device_search_table_state: TableState,
+    pub last_search_input: Option<std::time::Instant>,
+    pub last_searched_query: String,
 }
 
 impl Default for App {
@@ -269,6 +279,15 @@ impl Default for App {
             datto_av_alerts: HashMap::new(),
             datto_av_policies: HashMap::new(),
             scan_status: HashMap::new(),
+
+            show_device_search: false,
+            device_search_query: String::new(),
+            device_search_results: Vec::new(),
+            device_search_loading: false,
+            device_search_error: None,
+            device_search_table_state: TableState::default(),
+            last_search_input: None,
+            last_searched_query: String::new(),
         }
     }
 }
@@ -314,7 +333,6 @@ impl App {
             })?;
 
             match events.next().await? {
-                Event::Tick => {}
                 Event::Key(key) => self.handle_key_event(key, events.sender()),
                 Event::Mouse(_) => {}
                 Event::Resize(_, _) => {}
@@ -330,7 +348,48 @@ impl App {
         tx: tokio::sync::mpsc::UnboundedSender<Event>,
     ) -> Result<()> {
         match event {
-            Event::Tick | Event::Key(_) | Event::Mouse(_) | Event::Resize(_, _) => {}
+            Event::Tick => {
+                // Handle Device Search Debounce
+                if self.show_device_search {
+                    if let Some(last_input) = self.last_search_input {
+                        if last_input.elapsed() >= std::time::Duration::from_millis(500) {
+                             // Log debounce check
+                             let _ = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("debug.log")
+                                .map(|mut f| {
+                                     use std::io::Write;
+                                     writeln!(f, "Tick: Checking search. Query='{}', Last='{}'", self.device_search_query, self.last_searched_query).unwrap();
+                                });
+
+                            if self.device_search_query.len() >= 3
+                                && self.device_search_query != self.last_searched_query
+                            {
+                                self.last_searched_query = self.device_search_query.clone();
+                                self.search_devices(self.device_search_query.clone(), tx.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Event::Key(_) | Event::Mouse(_) | Event::Resize(_, _) => {}
+            Event::DeviceSearchResultsFetched(result) => {
+                self.device_search_loading = false;
+                match result {
+                    Ok(response) => {
+                        self.device_search_results = response.devices;
+                        if !self.device_search_results.is_empty() {
+                            self.device_search_table_state.select(Some(0));
+                        } else {
+                            self.device_search_table_state.select(None);
+                        }
+                    }
+                    Err(e) => {
+                        self.device_search_error = Some(e);
+                    }
+                }
+            }
             Event::SitesFetched(result) => {
                 self.is_loading = false;
                 match result {
@@ -957,6 +1016,33 @@ impl App {
         }
     }
 
+    fn search_devices(&mut self, query: String, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(client) = &self.client {
+            self.device_search_loading = true;
+            self.device_search_error = None;
+            self.device_search_results.clear();
+            
+            // Log search trigger
+             let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("debug.log")
+                .map(|mut f| {
+                     use std::io::Write;
+                     writeln!(f, "Triggering API Search for: {}", query).unwrap();
+                });
+
+            let client = client.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .search_devices(&query)
+                    .await
+                    .map_err(|e| e.to_string());
+                tx.send(Event::DeviceSearchResultsFetched(result)).unwrap();
+            });
+        }
+    }
+
     fn fetch_activity_logs(
         &mut self,
         _device_uid: String,
@@ -1327,6 +1413,13 @@ impl App {
              writeln!(f, "Key Event: {:?} | Mode: {:?}", key.code, self.input_state.mode).unwrap();
         });
         */
+        
+        // Handle Device Search Input
+        if self.show_device_search {
+            self.handle_device_search_input(key, tx);
+            return;
+        }
+
         // Handle Input Mode first
         if self.input_state.mode == InputMode::Editing {
             match key.code {
@@ -1400,6 +1493,22 @@ impl App {
                 _ => {}
             }
             return;
+        }
+
+        match key.code {
+            KeyCode::Char('/') => {
+                self.show_device_search = true;
+                // Don't clear query if we want to remember last search?
+                // User said "first, I want a popup search...".
+                // Usually search clears or selects all. Let's clear for now.
+                self.device_search_query.clear();
+                self.device_search_results.clear();
+                self.last_search_input = None;
+                self.last_searched_query.clear();
+                self.device_search_error = None;
+                return;
+            }
+            _ => {}
         }
 
         match self.current_view {
@@ -2270,5 +2379,118 @@ impl App {
             None => 0,
         };
         self.activity_logs_table_state.select(Some(i));
+    }
+
+    fn handle_device_search_input(
+        &mut self,
+        key: KeyEvent,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                self.show_device_search = false;
+            }
+            KeyCode::Enter => {
+                // Select device
+                if let Some(idx) = self.device_search_table_state.selected() {
+                    if let Some(device) = self.device_search_results.get(idx).cloned() {
+                        self.selected_device = Some(device.clone());
+                        self.current_view = CurrentView::DeviceDetail;
+                        self.show_device_search = false;
+
+                        // Trigger side effects like fetching security data
+                         let is_sophos = device
+                            .antivirus
+                            .as_ref()
+                            .and_then(|av| av.antivirus_product.as_ref())
+                            .map(|prod| prod.to_lowercase().contains("sophos"))
+                            .unwrap_or(false);
+
+                        let is_datto = device
+                            .antivirus
+                            .as_ref()
+                            .and_then(|av| av.antivirus_product.as_ref())
+                            .map(|prod| prod.to_lowercase().contains("datto"))
+                            .unwrap_or(false);
+
+                        if is_sophos {
+                            let sophos_params = if let Some(site) =
+                                self.sites.iter().find(|s| s.uid == device.site_uid)
+                            {
+                                if let Some(vars) = &site.variables {
+                                    if let Some(id_var) =
+                                        vars.iter().find(|v| v.name == "tuiMdrId")
+                                    {
+                                        let region = vars
+                                            .iter()
+                                            .find(|v| v.name == "tuiMdrRegion")
+                                            .map(|v| v.value.clone());
+                                        Some((id_var.value.clone(), region))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some((id, region)) = sophos_params {
+                                self.fetch_sophos_endpoint(
+                                    id,
+                                    region,
+                                    device.hostname.clone(),
+                                    tx.clone(),
+                                );
+                            }
+                        }
+
+                        if is_datto {
+                            self.fetch_datto_av_agent(
+                                device.hostname.clone(),
+                                device.udf.clone(),
+                                tx.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                self.device_search_query.push(c);
+                self.last_search_input = Some(std::time::Instant::now());
+            }
+            KeyCode::Backspace => {
+                self.device_search_query.pop();
+                self.last_search_input = Some(std::time::Instant::now());
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                let i = match self.device_search_table_state.selected() {
+                    Some(i) => {
+                        if i >= self.device_search_results.len().saturating_sub(1) {
+                            0
+                        } else {
+                            i + 1
+                        }
+                    }
+                    None => 0,
+                };
+                self.device_search_table_state.select(Some(i));
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                let i = match self.device_search_table_state.selected() {
+                    Some(i) => {
+                        if i == 0 {
+                            self.device_search_results.len().saturating_sub(1)
+                        } else {
+                            i - 1
+                        }
+                    }
+                    None => 0,
+                };
+                self.device_search_table_state.select(Some(i));
+            }
+            _ => {}
+        }
     }
 }

@@ -40,6 +40,7 @@ pub enum Event {
         Result<Vec<crate::api::datto_av::types::Alert>, String>,
     ),
     DattoAvPoliciesFetched(String, Result<serde_json::Value, String>),
+    DeviceSearchResultsFetched(Result<DevicesResponse, String>),
     ActivityLogsFetched(Result<ActivityLogsResponse, String>),
     JobResultFetched(Result<JobResult, String>),
     JobStdOutFetched(Result<Vec<crate::api::datto::types::JobStdOutput>, String>),

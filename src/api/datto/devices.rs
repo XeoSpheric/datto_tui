@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 pub(crate) trait DevicesApi {
     async fn get_devices(&self, site_uid: &str, page: i32, max: i32) -> Result<DevicesResponse>;
+    async fn search_devices(&self, hostname: &str) -> Result<DevicesResponse>;
     async fn update_device_udf(&self, device_uid: &str, udf: &Udf) -> Result<()>;
 }
 
@@ -36,6 +37,50 @@ impl DevicesApi for DattoClient {
             .text()
             .await
             .context("Failed to get response text")?;
+
+        let devices_response = serde_json::from_str(&text).context("Failed to parse JSON")?;
+        Ok(devices_response)
+    }
+
+    async fn search_devices(&self, hostname: &str) -> Result<DevicesResponse> {
+        let access_token = self.access_token.as_ref().context("Not authenticated")?;
+
+        let url = format!("{}/api/v2/account/devices", self.config.api_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(access_token)
+            .header("Content-Type", "application/json")
+            .query(&[("hostname", hostname), ("max", "5")])
+            .send()
+            .await
+            .context("Failed to send request")?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to get response text")?;
+
+        // Debug Log
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("debug.log")
+            .map(|mut f| {
+                use std::io::Write;
+                writeln!(
+                    f,
+                    "Search Devices Query: hostname={} | Status: {} | Response: {}",
+                    hostname, status, text
+                )
+                .unwrap();
+            });
+
+        if !status.is_success() {
+            anyhow::bail!("API search request failed with status: {} - {}", status, text);
+        }
 
         let devices_response = serde_json::from_str(&text).context("Failed to parse JSON")?;
         Ok(devices_response)

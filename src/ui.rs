@@ -18,12 +18,14 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     let status_text = match app.current_view {
         CurrentView::List => {
             format!(
-                "Kyber TUI | Sites: {} | 'q': quit, 'r': reload, 'j/k': move, 'Enter': details",
+                "Kyber TUI | Sites: {} | 'q': quit, 'r': reload, '/': search devices, 'j/k': move, 'Enter': details",
                 app.total_count
             )
         }
-        CurrentView::Detail => "Detail View | 'Esc'/'q': back".to_string(),
-        CurrentView::DeviceDetail => "Device Detail | 'Esc'/'q': back".to_string(),
+        CurrentView::Detail => "Detail View | 'Esc'/'q': back, '/': search devices".to_string(),
+        CurrentView::DeviceDetail => {
+            "Device Detail | 'Esc'/'q': back, '/': search devices".to_string()
+        }
         CurrentView::ActivityDetail => "Activity Detail | 'Esc'/'q': back".to_string(),
     };
 
@@ -65,6 +67,11 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
     // Render Popup
     render_popup(app, frame);
+
+    // Render Device Search Popup
+    if app.show_device_search {
+        render_device_search_popup(app, frame);
+    }
 }
 
 fn render_list(app: &mut App, frame: &mut Frame, area: Rect, block: Block) {
@@ -1541,5 +1548,124 @@ fn render_popup(app: &App, frame: &mut Frame) {
                 .scroll((0, 0)); // TODO: Add scrolling state for popup if content is long
             frame.render_widget(p, area);
         }
+    }
+}
+
+fn render_device_search_popup(app: &mut App, frame: &mut Frame) {
+    let area = centered_rect(80, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Search Devices ")
+        .title_bottom(Line::from(" Esc: close | Enter: select ").right_aligned())
+        .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(block.clone(), area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(3), // Input
+            Constraint::Length(1), // Status/Warning
+            Constraint::Min(0),    // Results
+        ])
+        .split(area);
+
+    // Input
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Hostname Search ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let input = Paragraph::new(app.device_search_query.clone())
+        .block(input_block)
+        .style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_widget(input, layout[0]);
+
+    // Status/Warning
+    let status_text = if app.device_search_loading {
+        Span::styled("Loading...", Style::default().fg(Color::Yellow))
+    } else if let Some(err) = &app.device_search_error {
+        Span::styled(format!("Error: {}", err), Style::default().fg(Color::Red))
+    } else if app.device_search_query.len() < 3 {
+        Span::styled(
+            "Type at least 3 characters...",
+            Style::default().fg(Color::Gray),
+        )
+    } else if app.device_search_results.is_empty() && !app.device_search_query.is_empty() {
+        Span::styled("No results found.", Style::default().fg(Color::Yellow))
+    } else {
+        Span::styled(
+            format!("Found {} devices", app.device_search_results.len()),
+            Style::default().fg(Color::Green),
+        )
+    };
+
+    frame.render_widget(Paragraph::new(status_text), layout[1]);
+
+    // Results
+    if !app.device_search_results.is_empty() {
+        let rows: Vec<Row> = app
+            .device_search_results
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let style = if Some(i) == app.device_search_table_state.selected() {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let status = if d.online { "Online" } else { "Offline" };
+                let status_color = if d.online { Color::Green } else { Color::Gray };
+
+                let os = d.operating_system.as_deref().unwrap_or("N/A");
+                let patch = d
+                    .patch_management
+                    .as_ref()
+                    .and_then(|pm| pm.patch_status.clone())
+                    .unwrap_or("Unknown".to_string());
+
+                Row::new(vec![
+                    Cell::from(d.hostname.clone()),
+                    Cell::from(d.site_name.as_deref().unwrap_or("").to_string()),
+                    Cell::from(Span::styled(status, Style::default().fg(status_color))),
+                    Cell::from(os),
+                    Cell::from(patch),
+                ])
+                .style(style)
+            })
+            .collect();
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Percentage(25), // Hostname
+                Constraint::Percentage(25), // Site
+                Constraint::Percentage(10), // Status
+                Constraint::Percentage(25), // OS
+                Constraint::Percentage(15), // Patch
+            ],
+        )
+        .header(
+            Row::new(vec!["Hostname", "Site", "Status", "OS", "Patch"]).style(
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            ),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Results ")
+                .border_style(Style::default().fg(Color::White)),
+        )
+        .highlight_symbol(">> ");
+
+        frame.render_stateful_widget(table, layout[2], &mut app.device_search_table_state);
     }
 }
