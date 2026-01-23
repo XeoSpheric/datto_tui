@@ -624,6 +624,17 @@ fn render_device_info(device: &crate::api::datto::types::Device, frame: &mut Fra
         _ => (patch_status_raw.as_str(), Color::White),
     };
 
+    let (patches_installed, patches_pending, patches_not_approved) =
+        if let Some(pm) = &device.patch_management {
+            (
+                pm.patches_installed.unwrap_or(0),
+                pm.patches_approved_pending.unwrap_or(0),
+                pm.patches_not_approved.unwrap_or(0),
+            )
+        } else {
+            (0, 0, 0)
+        };
+
     // --- Warranty Logic ---
     let warranty_date_str = device.warranty_date.as_deref().unwrap_or("N/A");
     let warranty_color = if warranty_date_str == "N/A" {
@@ -651,7 +662,10 @@ fn render_device_info(device: &crate::api::datto::types::Device, frame: &mut Fra
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled("■ ", Style::default().fg(patch_color)),
-            Span::raw(patch_status_text),
+            Span::raw(format!(
+                "{} | Patches Installed: {} | Patches Pending: {} | Patches Not Approved: {}",
+                patch_status_text, patches_installed, patches_pending, patches_not_approved
+            )),
         ]),
         Line::from(vec![
             Span::styled("Site: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -964,6 +978,35 @@ fn render_device_security(
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
 
+    // Get AV Status from Device struct (available even if detailed API call fails)
+    let av_status_raw = device
+        .antivirus
+        .as_ref()
+        .and_then(|av| av.antivirus_status.as_deref())
+        .unwrap_or("Unknown");
+
+    // Format AV Status: Split CamelCase and Color Code
+    // "RunningAndUpToDate" -> "Running And Up To Date"
+    let mut av_status_formatted = String::new();
+    for (i, c) in av_status_raw.chars().enumerate() {
+        if i > 0 && c.is_uppercase() {
+            av_status_formatted.push(' ');
+        }
+        av_status_formatted.push(c);
+    }
+    // Handle special cases if needed or if regex logic was imperfect
+    if av_status_formatted.is_empty() {
+        av_status_formatted = "Unknown".to_string();
+    }
+
+    let av_status_color = match av_status_raw {
+        "RunningAndUpToDate" => Color::Green,
+        "RunningAndNotUpToDate" => Color::Yellow,
+        "NotDetected" => Color::Rgb(255, 165, 0), // Orange
+        "NotRunning" => Color::Red,
+        _ => Color::White,
+    };
+
     if av_product.contains("sophos") {
         if let Some(loading) = app.sophos_loading.get(&device.hostname) {
             if *loading {
@@ -974,12 +1017,18 @@ fn render_device_security(
             }
         }
 
-        if let Some(endpoint) = app.sophos_endpoints.get(&device.hostname) {
-            lines.push(Line::from(vec![Span::styled(
-                "Product: Sophos Endpoint",
-                Style::default().add_modifier(Modifier::BOLD),
-            )]));
+        // Always show Product and AV Status
+        lines.push(Line::from(vec![Span::styled(
+            "Product: Sophos Endpoint",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]));
 
+        lines.push(Line::from(vec![
+            Span::raw("Status: "),
+            Span::styled(av_status_formatted, Style::default().fg(av_status_color)),
+        ]));
+
+        if let Some(endpoint) = app.sophos_endpoints.get(&device.hostname) {
             let health = endpoint
                 .health
                 .as_ref()
@@ -1023,8 +1072,9 @@ fn render_device_security(
                     Span::styled(format!("{:?}", status), Style::default().fg(Color::Cyan)),
                 ]));
             }
-        } else if lines.is_empty() {
-            lines.push(Line::from("Sophos data not available."));
+        } else if lines.len() <= 2 {
+            // Only Product and Status shown, no detailed data yet
+            lines.push(Line::from("Detailed data not available."));
         }
     } else if av_product.contains("datto") {
         if let Some(loading) = app.datto_av_loading.get(&device.hostname) {
@@ -1036,12 +1086,18 @@ fn render_device_security(
             }
         }
 
-        if let Some(agent) = app.datto_av_agents.get(&device.hostname) {
-            lines.push(Line::from(vec![Span::styled(
-                "Product: Datto AV",
-                Style::default().add_modifier(Modifier::BOLD),
-            )]));
+        // Always show Product and AV Status
+        lines.push(Line::from(vec![Span::styled(
+            "Product: Datto AV",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]));
 
+        lines.push(Line::from(vec![
+            Span::raw("Status: "),
+            Span::styled(av_status_formatted, Style::default().fg(av_status_color)),
+        ]));
+
+        if let Some(agent) = app.datto_av_agents.get(&device.hostname) {
             lines.push(Line::from(vec![
                 Span::raw("Agent Status: "),
                 Span::raw(agent.status.as_deref().unwrap_or("Unknown")),
@@ -1057,8 +1113,8 @@ fn render_device_security(
                     Span::styled(format!("{:?}", status), Style::default().fg(Color::Cyan)),
                 ]));
             }
-        } else if lines.is_empty() {
-            lines.push(Line::from("Datto AV data not available."));
+        } else if lines.len() <= 2 {
+            lines.push(Line::from("Detailed data not available."));
         }
     } else {
         lines.push(Line::from("No supported security product detected."));

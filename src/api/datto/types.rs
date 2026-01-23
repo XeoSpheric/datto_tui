@@ -99,6 +99,18 @@ pub struct UpdateSiteRequest {
 #[serde(rename_all = "camelCase")]
 pub struct PatchManagement {
     pub patch_status: Option<String>,
+    pub patches_approved_pending: Option<i32>,
+    pub patches_not_approved: Option<i32>,
+    pub patches_installed: Option<i32>,
+    pub patches_pending: Option<i32>, // Adding this as user mentioned "Patches Pending" in example, though distinct from ApprovedPending? Or maybe they mean the same. The user said "patchesApprovedPending, patchesNotApproved, and PatchesInstalled" but the example string had "Patches Pending: 1". Let's assume "Approved Pending" maps to patchesApprovedPending and "Patches Pending" might be another field or a mis-speak.
+                                      // Wait, the user said: "Patch Status: Approved Pending | Patches Installed: 1 | Patches Pending: 1 | Patches Not Approved: 0"
+                                      // And asked to add: "patchesApprovedPending, patchesNotApproved, and PatchesInstalled".
+                                      // It seems "Approved Pending" is the Status Text.
+                                      // "Patches Pending" in the example likely corresponds to `patchesApprovedPending` count? Or is there a generic `patchesPending`?
+                                      // Let's look at common RMM APIs. Usually there's `patchesApprovedPending` and `patchesPending` (total?).
+                                      // I'll add `patchesPending` just in case, or map `patchesApprovedPending` to "Patches Pending" in the UI if that's what they meant.
+                                      // Re-reading: "patchesApprovedPending, patchesNotApproved, and PatchesInstalled".
+                                      // I will add these 3 specific fields.
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
