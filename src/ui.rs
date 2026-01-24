@@ -1,5 +1,6 @@
 use crate::app::{
-    App, CurrentView, DeviceDetailTab, InputField, InputMode, JobViewRow, SiteDetailTab,
+    App, CurrentView, DeviceDetailTab, InputField, InputMode, JobViewRow, RunComponentStep,
+    SiteDetailTab,
 };
 use crate::app_helpers::generate_job_rows;
 use chrono::DateTime;
@@ -71,6 +72,11 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Render Device Search Popup
     if app.show_device_search {
         render_device_search_popup(app, frame);
+    }
+
+    // Render Run Component Popup
+    if app.show_run_component {
+        render_run_component_popup(app, frame);
     }
 }
 
@@ -348,8 +354,19 @@ fn render_device_list(app: &mut App, frame: &mut Frame, area: Rect) {
                     _ => Color::Gray,
                 };
 
+                let mut device_type = device
+                    .device_type
+                    .as_ref()
+                    .and_then(|dt| dt.type_field.clone())
+                    .unwrap_or_else(|| "Unknown".to_string());
+
+                if device_type == "Main System Chassis" {
+                    device_type = "Server".to_string();
+                }
+
                 Row::new(vec![
                     Cell::from(device.hostname.clone()),
+                    Cell::from(device_type),
                     Cell::from(Span::styled(status, Style::default().fg(status_color))),
                     Cell::from(Span::styled(patch_status, Style::default().fg(patch_color))),
                 ])
@@ -360,13 +377,14 @@ fn render_device_list(app: &mut App, frame: &mut Frame, area: Rect) {
         let table = Table::new(
             rows,
             [
-                Constraint::Percentage(40),
-                Constraint::Percentage(20),
-                Constraint::Percentage(40),
+                Constraint::Percentage(35),
+                Constraint::Percentage(15),
+                Constraint::Percentage(15),
+                Constraint::Percentage(35),
             ],
         )
         .header(
-            Row::new(vec!["Hostname", "Status", "Patch Status"])
+            Row::new(vec!["Hostname", "Type", "Status", "Patch Status"])
                 .style(Style::default().add_modifier(Modifier::BOLD)),
         )
         .block(devices_block)
@@ -541,6 +559,296 @@ fn render_input_modal(app: &mut App, frame: &mut Frame) {
         let instructions = Paragraph::new("Tab: switch field | Enter: submit | Esc: cancel")
             .alignment(Alignment::Center);
         frame.render_widget(instructions, layout[2]);
+    }
+}
+
+fn render_run_component_popup(app: &mut App, frame: &mut Frame) {
+    let area = centered_rect(70, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    let title = match app.run_component_step {
+        RunComponentStep::Search => "Run Component - Select (Esc to cancel)",
+        RunComponentStep::FillVariables => "Run Component - Variables (Esc to back)",
+        RunComponentStep::Review => "Run Component - Review (Esc to back, Enter to Run)",
+        RunComponentStep::Result => "Run Component - Result (Enter/Esc to close)",
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(block.clone(), area);
+
+    let inner_area = block.inner(area);
+
+    match app.run_component_step {
+        RunComponentStep::Search => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3), // Search Input
+                    Constraint::Min(0),    // List
+                ])
+                .split(inner_area);
+
+            // Search Input
+            let input_block = Block::default()
+                .borders(Borders::ALL)
+                .title("Search Component");
+            let input = Paragraph::new(app.component_search_query.clone()).block(input_block);
+            frame.render_widget(input, layout[0]);
+
+            // Component List
+            if app.components_loading {
+                frame.render_widget(
+                    Paragraph::new("Loading components...").alignment(Alignment::Center),
+                    layout[1],
+                );
+            } else if let Some(err) = &app.component_error {
+                frame.render_widget(
+                    Paragraph::new(format!("Error: {}", err))
+                        .style(Style::default().fg(Color::Red)),
+                    layout[1],
+                );
+            } else {
+                let rows: Vec<Row> = app
+                    .filtered_components
+                    .iter()
+                    .enumerate()
+                    .map(|(i, comp)| {
+                        let style = if Some(i) == app.component_list_state.selected() {
+                            Style::default().add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default()
+                        };
+                        Row::new(vec![
+                            Cell::from(comp.name.clone()),
+                            Cell::from(comp.category_code.clone().unwrap_or_default()),
+                            Cell::from(comp.description.clone().unwrap_or_default()),
+                        ])
+                        .style(style)
+                    })
+                    .collect();
+
+                let table = Table::new(
+                    rows,
+                    [
+                        Constraint::Percentage(30),
+                        Constraint::Percentage(15),
+                        Constraint::Percentage(55),
+                    ],
+                )
+                .header(
+                    Row::new(vec!["Name", "Category", "Description"])
+                        .style(Style::default().add_modifier(Modifier::BOLD)),
+                )
+                .highlight_symbol(">> ");
+
+                frame.render_stateful_widget(table, layout[1], &mut app.component_list_state);
+            }
+        }
+        RunComponentStep::FillVariables => {
+            if let Some(component) = &app.selected_component {
+                if let Some(vars) = &component.variables {
+                    // Find current variable definition
+                    // We need to match by name from app.component_variables[app.component_variable_index]
+                    if let Some(current_var) =
+                        app.component_variables.get(app.component_variable_index)
+                    {
+                        // Find full definition
+                        let def = vars.iter().find(|v| v.name == current_var.name);
+
+                        let layout = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([
+                                Constraint::Length(3), // Progress
+                                Constraint::Length(5), // Variable Info
+                                Constraint::Length(3), // Input
+                                Constraint::Min(0),    // Description/Help
+                            ])
+                            .split(inner_area);
+
+                        // Progress
+                        let progress = format!(
+                            "Variable {} of {}",
+                            app.component_variable_index + 1,
+                            app.component_variables.len()
+                        );
+                        frame.render_widget(
+                            Paragraph::new(progress).alignment(Alignment::Center),
+                            layout[0],
+                        );
+
+                        // Info
+                        let mut type_str = def
+                            .and_then(|v| v.variable_type.as_ref())
+                            .map(|s| s.as_str())
+                            .unwrap_or("String")
+                            .to_string();
+
+                        if type_str.eq_ignore_ascii_case("map") {
+                            type_str = "Selection (Map)".to_string();
+                        }
+
+                        let info_text = vec![
+                            Line::from(vec![
+                                Span::styled(
+                                    "Name: ",
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                ),
+                                Span::raw(&current_var.name),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(
+                                    "Type: ",
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                ),
+                                Span::raw(type_str),
+                            ]),
+                        ];
+                        frame.render_widget(Paragraph::new(info_text), layout[1]);
+
+                        // Input
+                        let input_block = Block::default()
+                            .borders(Borders::ALL)
+                            .title("Value")
+                            .style(Style::default().fg(Color::Yellow));
+
+                        let input_val = app.component_variable_input.clone();
+                        // If it's a dropdown/selection, maybe hint options?
+                        // If type is "Boolean", hint "true/false"
+
+                        frame
+                            .render_widget(Paragraph::new(input_val).block(input_block), layout[2]);
+
+                        // Description
+                        if let Some(d) = def {
+                            if let Some(desc) = &d.description {
+                                let desc_block =
+                                    Block::default().borders(Borders::ALL).title("Description");
+                                frame.render_widget(
+                                    Paragraph::new(desc.as_str())
+                                        .block(desc_block)
+                                        .wrap(Wrap { trim: true }),
+                                    layout[3],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        RunComponentStep::Review => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3), // Header
+                    Constraint::Min(0),    // Variables List
+                    Constraint::Length(3), // Footer
+                ])
+                .split(inner_area);
+
+            if let Some(comp) = &app.selected_component {
+                frame.render_widget(
+                    Paragraph::new(format!("Review Job: {}", comp.name))
+                        .style(
+                            Style::default()
+                                .add_modifier(Modifier::BOLD)
+                                .fg(Color::Cyan),
+                        )
+                        .alignment(Alignment::Center),
+                    layout[0],
+                );
+
+                let rows: Vec<Row> = app
+                    .component_variables
+                    .iter()
+                    .map(|v| {
+                        Row::new(vec![
+                            Cell::from(v.name.clone()),
+                            Cell::from(v.value.clone()),
+                        ])
+                    })
+                    .collect();
+
+                let table = Table::new(
+                    rows,
+                    [Constraint::Percentage(40), Constraint::Percentage(60)],
+                )
+                .header(
+                    Row::new(vec!["Variable", "Value"])
+                        .style(Style::default().add_modifier(Modifier::BOLD)),
+                )
+                .block(Block::default().borders(Borders::ALL));
+
+                frame.render_widget(table, layout[1]);
+
+                frame.render_widget(
+                    Paragraph::new("Press ENTER to Execute Job")
+                        .style(
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::SLOW_BLINK),
+                        )
+                        .alignment(Alignment::Center),
+                    layout[2],
+                );
+            }
+        }
+        RunComponentStep::Result => {
+            if app.components_loading {
+                frame.render_widget(
+                    Paragraph::new("Executing Job...").alignment(Alignment::Center),
+                    inner_area,
+                );
+            } else if let Some(err) = &app.component_error {
+                frame.render_widget(
+                    Paragraph::new(format!("Error: {}", err))
+                        .style(Style::default().fg(Color::Red))
+                        .wrap(Wrap { trim: true }),
+                    inner_area,
+                );
+            } else if let Some(response) = &app.last_job_response {
+                let job_info = response.job.as_ref();
+                let job_name = job_info
+                    .and_then(|j| j.name.as_deref())
+                    .unwrap_or("Unknown");
+                let job_id = job_info
+                    .map(|j| j.id.to_string())
+                    .unwrap_or_else(|| "N/A".to_string());
+                let job_status = job_info
+                    .and_then(|j| j.status.as_deref())
+                    .unwrap_or("Unknown");
+
+                let text = vec![
+                    Line::from(Span::styled(
+                        "Job Executed Successfully!",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Job Name: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(job_name),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Job ID: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(job_id),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(job_status),
+                    ]),
+                    Line::from(""),
+                    Line::from("Check Activity Log for status."),
+                ];
+                frame.render_widget(
+                    Paragraph::new(text).alignment(Alignment::Center),
+                    inner_area,
+                );
+            }
+        }
     }
 }
 
@@ -774,6 +1082,21 @@ fn render_device_info(device: &crate::api::datto::types::Device, frame: &mut Fra
         Line::from(vec![
             Span::styled("Site: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(device.site_name.as_deref().unwrap_or("N/A")),
+        ]),
+        Line::from(vec![
+            Span::styled("Type: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw({
+                let t = device
+                    .device_type
+                    .as_ref()
+                    .and_then(|dt| dt.type_field.as_deref())
+                    .unwrap_or("Unknown");
+                if t == "Main System Chassis" {
+                    "Server"
+                } else {
+                    t
+                }
+            }),
         ]),
         Line::from(vec![
             Span::styled("OS: ", Style::default().add_modifier(Modifier::BOLD)),

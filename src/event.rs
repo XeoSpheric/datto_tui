@@ -46,6 +46,8 @@ pub enum Event {
     JobResultFetched(Result<JobResult, String>),
     JobStdOutFetched(Result<Vec<crate::api::datto::types::JobStdOutput>, String>),
     JobStdErrFetched(Result<Vec<crate::api::datto::types::JobStdOutput>, String>),
+    ComponentsFetched(Result<crate::api::datto::types::ComponentsResponse, String>),
+    QuickJobExecuted(Result<crate::api::datto::types::QuickJobResponse, String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

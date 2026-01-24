@@ -365,3 +365,92 @@ pub struct OpenAlertsResponse {
     pub page_details: PageDetails,
     pub alerts: Vec<Alert>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentVariable {
+    pub name: String,
+    pub default_val: Option<String>,
+    #[serde(rename = "type")]
+    pub variable_type: Option<String>, // "Selection", "String", "Date", "Boolean"
+    pub direction: Option<bool>, // true = input?
+    pub description: Option<String>,
+    pub variables_idx: Option<i32>,
+    // For selection types, we might expect options, but the user example didn't provide them.
+    // We'll see if we get them in a real response or if we need to parse them from somewhere else.
+    // Sometimes selection options are comma separated in description or something, but usually a list.
+    // I'll add a generic field just in case, but rely on user input if not found.
+    pub options: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Component {
+    pub id: i32,
+    pub credentials_required: Option<bool>,
+    pub uid: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category_code: Option<String>,
+    pub variables: Option<Vec<ComponentVariable>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentsResponse {
+    pub page_details: PageDetails,
+    pub components: Vec<Component>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickJobVariable {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickJobComponent {
+    pub component_uid: String,
+    pub variables: Vec<QuickJobVariable>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickJobRequest {
+    pub job_name: String,
+    pub job_component: QuickJobComponent,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickJobInfo {
+    pub id: i64,
+    pub date_created: Option<serde_json::Value>,
+    pub name: Option<String>,
+    pub uid: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickJobResponseVariable {
+    pub name: Option<String>,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickJobResponseComponent {
+    pub uid: Option<String>,
+    pub name: Option<String>,
+    pub variables: Option<Vec<QuickJobResponseVariable>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickJobResponse {
+    pub job_components: Option<Vec<QuickJobResponseComponent>>,
+    pub job: Option<QuickJobInfo>,
+}

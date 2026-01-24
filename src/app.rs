@@ -5,7 +5,8 @@ use crate::api::datto::devices::DevicesApi;
 use crate::api::datto::jobs::JobsApi;
 use crate::api::datto::sites::SitesApi;
 use crate::api::datto::types::{
-    ActivityLog, CreateVariableRequest, Device, JobResult, Site, UpdateSiteRequest,
+    ActivityLog, Component, CreateVariableRequest, Device, JobResult, QuickJobComponent,
+    QuickJobRequest, QuickJobResponse, QuickJobVariable, Site, UpdateSiteRequest,
     UpdateVariableRequest,
 };
 use crate::api::datto::variables::VariablesApi;
@@ -131,6 +132,14 @@ pub enum JobViewRow {
     StdErrLink(usize),      // Component Index
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum RunComponentStep {
+    Search,
+    FillVariables,
+    Review,
+    Result,
+}
+
 #[derive(Debug)]
 pub struct App {
     pub should_quit: bool,
@@ -221,6 +230,21 @@ pub struct App {
 
     // Device Variables Popup
     pub show_device_variables: bool,
+
+    // Run Component Popup
+    pub show_run_component: bool,
+    pub run_component_step: RunComponentStep,
+    pub components: Vec<Component>,
+    pub filtered_components: Vec<Component>,
+    pub component_search_query: String,
+    pub component_list_state: TableState,
+    pub selected_component: Option<Component>,
+    pub component_variables: Vec<QuickJobVariable>,
+    pub component_variable_index: usize,
+    pub component_variable_input: String,
+    pub last_job_response: Option<QuickJobResponse>,
+    pub component_error: Option<String>,
+    pub components_loading: bool,
 }
 
 impl Default for App {
@@ -305,6 +329,20 @@ impl Default for App {
             last_searched_query: String::new(),
 
             show_device_variables: false,
+
+            show_run_component: false,
+            run_component_step: RunComponentStep::Search,
+            components: Vec::new(),
+            filtered_components: Vec::new(),
+            component_search_query: String::new(),
+            component_list_state: TableState::default(),
+            selected_component: None,
+            component_variables: Vec::new(),
+            component_variable_index: 0,
+            component_variable_input: String::new(),
+            last_job_response: None,
+            component_error: None,
+            components_loading: false,
         }
     }
 }
@@ -1026,9 +1064,248 @@ impl App {
                     }
                 }
             }
+            Event::ComponentsFetched(result) => {
+                self.components_loading = false;
+                match result {
+                    Ok(response) => {
+                        self.components = response.components;
+                        // Sort by name
+                        self.components
+                            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                        
+                        // Initial filter (all)
+                        self.filtered_components = self.components.clone();
+                        
+                        if !self.filtered_components.is_empty() {
+                            self.component_list_state.select(Some(0));
+                        } else {
+                            self.component_list_state.select(None);
+                        }
+                    }
+                    Err(e) => {
+                        self.component_error = Some(e);
+                    }
+                }
+            }
+            Event::QuickJobExecuted(result) => {
+                self.components_loading = false;
+                match result {
+                    Ok(response) => {
+                        self.last_job_response = Some(response);
+                        self.run_component_step = RunComponentStep::Result;
+                    }
+                    Err(e) => {
+                        self.component_error = Some(e);
+                        self.run_component_step = RunComponentStep::Result;
+                    }
+                }
+            }
         }
 
         Ok(())
+    }
+
+    fn fetch_components(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(client) = &self.client {
+            self.components_loading = true;
+            self.component_error = None;
+            self.components.clear();
+            self.filtered_components.clear();
+            
+            let client = client.clone();
+            tokio::spawn(async move {
+                // Fetch first page, maybe loop if needed but start with one page
+                let result = client.get_components(None).await.map_err(|e| e.to_string());
+                tx.send(Event::ComponentsFetched(result)).unwrap();
+            });
+        }
+    }
+
+    fn run_component_job(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(client) = &self.client {
+            if let Some(device) = &self.selected_device {
+                if let Some(component) = &self.selected_component {
+                    self.components_loading = true;
+                    self.component_error = None;
+                    
+                    let client = client.clone();
+                    let device_uid = device.uid.clone();
+                    let req = QuickJobRequest {
+                        job_name: format!("Run Component: {}", component.name),
+                        job_component: QuickJobComponent {
+                            component_uid: component.uid.clone(),
+                            variables: self.component_variables.clone(),
+                        },
+                    };
+
+                    tokio::spawn(async move {
+                        let result = client.run_quick_job(&device_uid, req).await.map_err(|e| format!("{:#}", e));
+                        tx.send(Event::QuickJobExecuted(result)).unwrap();
+                    });
+                }
+            }
+        }
+    }
+
+    fn filter_components(&mut self) {
+        if self.component_search_query.is_empty() {
+            self.filtered_components = self.components.clone();
+        } else {
+            let query = self.component_search_query.to_lowercase();
+            self.filtered_components = self.components
+                .iter()
+                .filter(|c| c.name.to_lowercase().contains(&query))
+                .cloned()
+                .collect();
+        }
+        
+        // Reset selection
+        if !self.filtered_components.is_empty() {
+            self.component_list_state.select(Some(0));
+        } else {
+            self.component_list_state.select(None);
+        }
+    }
+
+    fn handle_run_component_input(&mut self, key: KeyEvent, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        match self.run_component_step {
+            RunComponentStep::Search => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.show_run_component = false;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if let Some(i) = self.component_list_state.selected() {
+                            let next = if i >= self.filtered_components.len().saturating_sub(1) {
+                                0
+                            } else {
+                                i + 1
+                            };
+                            self.component_list_state.select(Some(next));
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if let Some(i) = self.component_list_state.selected() {
+                            let next = if i == 0 {
+                                self.filtered_components.len().saturating_sub(1)
+                            } else {
+                                i - 1
+                            };
+                            self.component_list_state.select(Some(next));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(i) = self.component_list_state.selected() {
+                            if let Some(comp) = self.filtered_components.get(i) {
+                                self.selected_component = Some(comp.clone());
+                                // Prepare variables
+                                self.component_variables.clear();
+                                
+                                if let Some(vars) = &comp.variables {
+                                    // Sort by variablesIdx if possible
+                                    let mut sorted_vars = vars.clone();
+                                    sorted_vars.sort_by_key(|v| v.variables_idx.unwrap_or(0));
+                                    
+                                    for var in sorted_vars {
+                                        self.component_variables.push(QuickJobVariable {
+                                            name: var.name.clone(),
+                                            value: var.default_val.clone().unwrap_or_default(),
+                                        });
+                                    }
+                                }
+
+                                if self.component_variables.is_empty() {
+                                    self.run_component_step = RunComponentStep::Review;
+                                } else {
+                                    self.run_component_step = RunComponentStep::FillVariables;
+                                    self.component_variable_index = 0;
+                                    // Initialize input buffer with first variable's default
+                                    self.component_variable_input = self.component_variables[0].value.clone();
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.component_search_query.push(c);
+                        self.filter_components();
+                    }
+                    KeyCode::Backspace => {
+                        self.component_search_query.pop();
+                        self.filter_components();
+                    }
+                    _ => {}
+                }
+            }
+            RunComponentStep::FillVariables => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.run_component_step = RunComponentStep::Search;
+                    }
+                    KeyCode::Enter => {
+                        // Save current input to variable
+                        if let Some(var) = self.component_variables.get_mut(self.component_variable_index) {
+                            var.value = self.component_variable_input.clone();
+                        }
+
+                        // Move to next variable or Review
+                        if self.component_variable_index < self.component_variables.len() - 1 {
+                            self.component_variable_index += 1;
+                            // Load next variable value into buffer
+                            self.component_variable_input = self.component_variables[self.component_variable_index].value.clone();
+                        } else {
+                            self.run_component_step = RunComponentStep::Review;
+                        }
+                    }
+                    KeyCode::Up => {
+                        // Go back to previous variable
+                        if self.component_variable_index > 0 {
+                            // Save current (optional, but good UX)
+                            if let Some(var) = self.component_variables.get_mut(self.component_variable_index) {
+                                var.value = self.component_variable_input.clone();
+                            }
+                            
+                            self.component_variable_index -= 1;
+                            self.component_variable_input = self.component_variables[self.component_variable_index].value.clone();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.component_variable_input.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        self.component_variable_input.pop();
+                    }
+                    _ => {}
+                }
+            }
+            RunComponentStep::Review => {
+                match key.code {
+                    KeyCode::Esc => {
+                        if self.component_variables.is_empty() {
+                            self.run_component_step = RunComponentStep::Search;
+                        } else {
+                            self.run_component_step = RunComponentStep::FillVariables;
+                            // Go to last variable
+                            self.component_variable_index = self.component_variables.len() - 1;
+                            self.component_variable_input = self.component_variables[self.component_variable_index].value.clone();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        // Execute
+                        self.run_component_job(tx);
+                    }
+                    _ => {}
+                }
+            }
+            RunComponentStep::Result => {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc => {
+                        self.show_run_component = false;
+                        self.run_component_step = RunComponentStep::Search;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     fn fetch_rocket_incidents(&self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
@@ -1493,6 +1770,12 @@ impl App {
         });
         */
         
+        // Handle Run Component Input
+        if self.show_run_component {
+            self.handle_run_component_input(key, tx);
+            return;
+        }
+
         // Handle Device Search Input
         if self.show_device_search {
             self.handle_device_search_input(key, tx);
@@ -1810,6 +2093,12 @@ impl App {
                         if self.udf_table_state.selected().is_none() {
                             self.udf_table_state.select(Some(0));
                         }
+                    }
+                    KeyCode::Char('r') => {
+                        self.show_run_component = true;
+                        self.run_component_step = RunComponentStep::Search;
+                        self.component_search_query.clear();
+                        self.fetch_components(tx.clone());
                     }
                     KeyCode::Char('j') | KeyCode::Down => match self.device_detail_tab {
                         DeviceDetailTab::Activities => self.next_activity_log(),
