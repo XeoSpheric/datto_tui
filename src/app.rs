@@ -10,7 +10,7 @@ use crate::api::datto::types::{
     UpdateVariableRequest,
 };
 use crate::api::datto::variables::VariablesApi;
-use crate::event::{Event, EventHandler};
+use crate::event::{Event, EventHandler, ScanStatus};
 use crate::tui::Tui;
 use crate::ui;
 use anyhow::Result;
@@ -140,6 +140,23 @@ pub enum RunComponentStep {
     Result,
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub enum QuickAction {
+    ScheduleReboot,
+    RunComponent,
+    RunAvScan,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum RebootFocus {
+    RebootNow,
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+}
+
 #[derive(Debug)]
 pub struct App {
     pub should_quit: bool,
@@ -245,6 +262,18 @@ pub struct App {
     pub last_job_response: Option<QuickJobResponse>,
     pub component_error: Option<String>,
     pub components_loading: bool,
+
+    // Quick Actions Menu
+    pub show_quick_actions: bool,
+    pub quick_action_list_state: TableState,
+    pub quick_actions: Vec<QuickAction>,
+
+    // Reboot Popup
+    pub show_reboot_popup: bool,
+    pub reboot_now: bool,
+    pub reboot_segments: [String; 5], // YY, MM, DD, HH, mm
+    pub reboot_focus: RebootFocus,
+    pub reboot_error: Option<String>,
 }
 
 impl Default for App {
@@ -343,6 +372,24 @@ impl Default for App {
             last_job_response: None,
             component_error: None,
             components_loading: false,
+
+            // Quick Actions
+            show_quick_actions: false,
+            quick_action_list_state: TableState::default(),
+            quick_actions: Vec::new(),
+
+            // Reboot
+            show_reboot_popup: false,
+            reboot_now: true,
+            reboot_segments: [
+                String::new(), // YY
+                String::new(), // MM
+                String::new(), // DD
+                String::new(), // HH
+                String::new(), // mm
+            ],
+            reboot_focus: RebootFocus::RebootNow,
+            reboot_error: None,
         }
     }
 }
@@ -1308,6 +1355,294 @@ impl App {
         }
     }
 
+    fn handle_quick_action_input(&mut self, key: KeyEvent, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        match key.code {
+            KeyCode::Esc => {
+                self.show_quick_actions = false;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let next = match self.quick_action_list_state.selected() {
+                    Some(i) => if i >= self.quick_actions.len().saturating_sub(1) { 0 } else { i + 1 },
+                    None => 0,
+                };
+                self.quick_action_list_state.select(Some(next));
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let next = match self.quick_action_list_state.selected() {
+                    Some(i) => if i == 0 { self.quick_actions.len().saturating_sub(1) } else { i - 1 },
+                    None => 0,
+                };
+                self.quick_action_list_state.select(Some(next));
+            }
+            KeyCode::Enter => {
+                if let Some(i) = self.quick_action_list_state.selected() {
+                    if let Some(action) = self.quick_actions.get(i) {
+                        match action {
+                            QuickAction::ScheduleReboot => {
+                                self.show_quick_actions = false;
+                                self.show_reboot_popup = true;
+                                self.reboot_now = true;
+                                
+                                let now = chrono::Local::now();
+                                self.reboot_segments = [
+                                    now.format("%y").to_string(),
+                                    now.format("%m").to_string(),
+                                    now.format("%d").to_string(),
+                                    now.format("%H").to_string(),
+                                    now.format("%M").to_string(),
+                                ];
+                                
+                                self.reboot_focus = RebootFocus::RebootNow;
+                                self.reboot_error = None;
+                            }
+                            QuickAction::RunComponent => {
+                                self.show_quick_actions = false;
+                                self.show_run_component = true;
+                                self.run_component_step = RunComponentStep::Search;
+                                self.component_search_query.clear();
+                                self.fetch_components(tx);
+                            }
+                            QuickAction::RunAvScan => {
+                                self.show_quick_actions = false;
+                                if let Some(device) = self.selected_device.clone() {
+                                    let is_sophos = device.antivirus.as_ref()
+                                        .and_then(|av| av.antivirus_product.as_ref())
+                                        .map(|prod| prod.to_lowercase().contains("sophos"))
+                                        .unwrap_or(false);
+                                    let is_datto = device.antivirus.as_ref()
+                                        .and_then(|av| av.antivirus_product.as_ref())
+                                        .map(|prod| prod.to_lowercase().contains("datto"))
+                                        .unwrap_or(false);
+
+                                    if is_sophos {
+                                        // Find site variables for Sophos
+                                        let sophos_params = if let Some(site) = self.sites.iter().find(|s| s.uid == device.site_uid) {
+                                            if let Some(vars) = &site.variables {
+                                                vars.iter().find(|v| v.name == "tuiMdrId").map(|id_var| {
+                                                    let region = vars.iter().find(|v| v.name == "tuiMdrRegion").map(|v| v.value.clone());
+                                                    (id_var.value.clone(), region)
+                                                })
+                                            } else { None }
+                                        } else { None };
+
+                                        if let Some((t_id, region)) = sophos_params {
+                                            self.fetch_sophos_endpoint(t_id.clone(), region.clone(), device.hostname.clone(), tx.clone());
+                                            
+                                            // Start Scan if we have endpoint ID
+                                            if let Some(endpoint) = self.sophos_endpoints.get(&device.hostname) {
+                                                if let Some(client) = &self.sophos_client {
+                                                    let client = client.clone();
+                                                    let e_id = endpoint.id.clone();
+                                                    let region = region.unwrap_or_else(|| "us01".to_string());
+                                                    let h_name = device.hostname.clone();
+                                                    let tx_clone = tx.clone();
+                                                    self.scan_status.insert(h_name.clone(), ScanStatus::Starting);
+                                                    tokio::spawn(async move {
+                                                        let result = client.start_scan(&t_id, &region, &e_id).await.map_err(|e: anyhow::Error| e.to_string());
+                                                        tx_clone.send(Event::SophosScanStarted(h_name, result)).unwrap();
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    } else if is_datto {
+                                        if let Some(agent) = self.datto_av_agents.get(&device.hostname) {
+                                            if let Some(client) = &self.datto_av_client {
+                                                let client = client.clone();
+                                                let a_id = agent.id.clone();
+                                                let h_name = device.hostname.clone();
+                                                let tx_clone = tx.clone();
+                                                self.scan_status.insert(h_name.clone(), ScanStatus::Starting);
+                                                tokio::spawn(async move {
+                                                    let result = client.scan_agent(&a_id).await.map_err(|e: anyhow::Error| e.to_string());
+                                                    tx_clone.send(Event::DattoAvScanStarted(h_name, result)).unwrap();
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_reboot_input(&mut self, key: KeyEvent, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        match key.code {
+            KeyCode::Esc => {
+                self.show_reboot_popup = false;
+                self.show_quick_actions = true;
+            }
+            KeyCode::Tab => {
+                self.reboot_focus = match self.reboot_focus {
+                    RebootFocus::RebootNow => RebootFocus::Year,
+                    RebootFocus::Year => RebootFocus::Month,
+                    RebootFocus::Month => RebootFocus::Day,
+                    RebootFocus::Day => RebootFocus::Hour,
+                    RebootFocus::Hour => RebootFocus::Minute,
+                    RebootFocus::Minute => RebootFocus::RebootNow,
+                };
+            }
+            KeyCode::BackTab => {
+                self.reboot_focus = match self.reboot_focus {
+                    RebootFocus::RebootNow => RebootFocus::Minute,
+                    RebootFocus::Year => RebootFocus::RebootNow,
+                    RebootFocus::Month => RebootFocus::Year,
+                    RebootFocus::Day => RebootFocus::Month,
+                    RebootFocus::Hour => RebootFocus::Day,
+                    RebootFocus::Minute => RebootFocus::Hour,
+                };
+            }
+            KeyCode::Up => {
+                if self.reboot_focus == RebootFocus::RebootNow {
+                    self.reboot_focus = RebootFocus::Minute;
+                } else {
+                    self.adjust_reboot_segment(1);
+                }
+            }
+            KeyCode::Down => {
+                if self.reboot_focus == RebootFocus::RebootNow {
+                    self.reboot_focus = RebootFocus::Year;
+                } else {
+                    self.adjust_reboot_segment(-1);
+                }
+            }
+            KeyCode::Left => {
+                self.reboot_focus = match self.reboot_focus {
+                    RebootFocus::Year => RebootFocus::RebootNow,
+                    RebootFocus::Month => RebootFocus::Year,
+                    RebootFocus::Day => RebootFocus::Month,
+                    RebootFocus::Hour => RebootFocus::Day,
+                    RebootFocus::Minute => RebootFocus::Hour,
+                    _ => self.reboot_focus,
+                };
+            }
+            KeyCode::Right => {
+                self.reboot_focus = match self.reboot_focus {
+                    RebootFocus::RebootNow => RebootFocus::Year,
+                    RebootFocus::Year => RebootFocus::Month,
+                    RebootFocus::Month => RebootFocus::Day,
+                    RebootFocus::Day => RebootFocus::Hour,
+                    RebootFocus::Hour => RebootFocus::Minute,
+                    _ => self.reboot_focus,
+                };
+            }
+            KeyCode::Char(' ') if self.reboot_focus == RebootFocus::RebootNow => {
+                self.reboot_now = !self.reboot_now;
+            }
+            KeyCode::Char(c) if c.is_digit(10) => {
+                if self.reboot_now && self.reboot_focus != RebootFocus::RebootNow {
+                    // If reboot now is checked, don't allow typing in time segments?
+                    // Or automatically uncheck it? 
+                    // User said "if that box is unchecked allow the user to select a date and time"
+                    // Let's stay checked but maybe uncheck if they start typing?
+                    // Actually, let's just do nothing if reboot_now is true, OR uncheck it.
+                    // "if that box is unchecked" implies it must be unchecked first.
+                }
+                
+                if !self.reboot_now {
+                    let idx = match self.reboot_focus {
+                        RebootFocus::Year => Some(0),
+                        RebootFocus::Month => Some(1),
+                        RebootFocus::Day => Some(2),
+                        RebootFocus::Hour => Some(3),
+                        RebootFocus::Minute => Some(4),
+                        _ => None,
+                    };
+                    
+                    if let Some(i) = idx {
+                        // Override logic: if we just entered or just want to replace
+                        // Simplest: push and keep last 2
+                        let mut s = self.reboot_segments[i].clone();
+                        s.push(c);
+                        if s.len() > 2 {
+                            s.remove(0);
+                        }
+                        self.reboot_segments[i] = s;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                // Validation
+                if !self.reboot_now {
+                    let date_str = self.reboot_segments.join("");
+                    if chrono::NaiveDateTime::parse_from_str(&date_str, "%y%m%d%H%M").is_err() {
+                        self.reboot_error = Some("Invalid Date/Time".to_string());
+                        return;
+                    }
+                }
+                self.run_reboot_job(tx);
+            }
+            _ => {}
+        }
+    }
+
+    fn adjust_reboot_segment(&mut self, delta: i32) {
+        if self.reboot_now { return; }
+        
+        let idx = match self.reboot_focus {
+            RebootFocus::Year => 0,
+            RebootFocus::Month => 1,
+            RebootFocus::Day => 2,
+            RebootFocus::Hour => 3,
+            RebootFocus::Minute => 4,
+            _ => return,
+        };
+        
+        let mut val: i32 = self.reboot_segments[idx].parse().unwrap_or(0);
+        val += delta;
+        
+        match self.reboot_focus {
+            RebootFocus::Year => { if val < 0 { val = 99; } if val > 99 { val = 0; } },
+            RebootFocus::Month => { if val < 1 { val = 12; } if val > 12 { val = 1; } },
+            RebootFocus::Day => { if val < 1 { val = 31; } if val > 31 { val = 1; } },
+            RebootFocus::Hour => { if val < 0 { val = 23; } if val > 23 { val = 0; } },
+            RebootFocus::Minute => { if val < 0 { val = 59; } if val > 59 { val = 0; } },
+            _ => {}
+        }
+        
+        self.reboot_segments[idx] = format!("{:02}", val);
+    }
+
+    fn run_reboot_job(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(client) = &self.client {
+            if let Some(device) = &self.selected_device {
+                self.show_reboot_popup = false;
+                self.show_run_component = true;
+                self.run_component_step = RunComponentStep::Result;
+                self.components_loading = true;
+                self.component_error = None;
+
+                let client = client.clone();
+                let device_uid = device.uid.clone();
+                let req = QuickJobRequest {
+                    job_name: "Schedule Reboot".to_string(),
+                    job_component: QuickJobComponent {
+                        component_uid: "8e6c9295-871e-41f1-8060-ca6899965b82".to_string(),
+                        variables: vec![
+                            QuickJobVariable {
+                                name: "rebootNow".to_string(),
+                                value: self.reboot_now.to_string(),
+                            },
+                            QuickJobVariable {
+                                name: "rebootString".to_string(),
+                                value: self.reboot_segments.join(""),
+                            },
+                        ],
+                    },
+                };
+
+                tokio::spawn(async move {
+                    let result = client.run_quick_job(&device_uid, req).await.map_err(|e| format!("{:#}", e));
+                    tx.send(Event::QuickJobExecuted(result)).unwrap();
+                });
+            }
+        }
+    }
+
+
     fn fetch_rocket_incidents(&self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
         if let Some(client) = &self.rocket_client {
             let client = client.clone();
@@ -1776,6 +2111,16 @@ impl App {
             return;
         }
 
+        if self.show_quick_actions {
+            self.handle_quick_action_input(key, tx);
+            return;
+        }
+
+        if self.show_reboot_popup {
+            self.handle_reboot_input(key, tx);
+            return;
+        }
+
         // Handle Device Search Input
         if self.show_device_search {
             self.handle_device_search_input(key, tx);
@@ -2095,10 +2440,25 @@ impl App {
                         }
                     }
                     KeyCode::Char('r') => {
-                        self.show_run_component = true;
-                        self.run_component_step = RunComponentStep::Search;
-                        self.component_search_query.clear();
-                        self.fetch_components(tx.clone());
+                        self.show_quick_actions = true;
+                        self.quick_actions = vec![QuickAction::ScheduleReboot, QuickAction::RunComponent];
+                        
+                        // Check if AV is Sophos or Datto for AV Scan action
+                        if let Some(device) = &self.selected_device {
+                            let is_sophos = device.antivirus.as_ref()
+                                .and_then(|av| av.antivirus_product.as_ref())
+                                .map(|prod| prod.to_lowercase().contains("sophos"))
+                                .unwrap_or(false);
+                            let is_datto = device.antivirus.as_ref()
+                                .and_then(|av| av.antivirus_product.as_ref())
+                                .map(|prod| prod.to_lowercase().contains("datto"))
+                                .unwrap_or(false);
+                            
+                            if is_sophos || is_datto {
+                                self.quick_actions.push(QuickAction::RunAvScan);
+                            }
+                        }
+                        self.quick_action_list_state.select(Some(0));
                     }
                     KeyCode::Char('j') | KeyCode::Down => match self.device_detail_tab {
                         DeviceDetailTab::Activities => self.next_activity_log(),

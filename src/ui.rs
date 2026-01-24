@@ -78,6 +78,16 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if app.show_run_component {
         render_run_component_popup(app, frame);
     }
+
+    // Render Quick Actions Menu
+    if app.show_quick_actions {
+        render_quick_action_menu(app, frame);
+    }
+
+    // Render Reboot Popup
+    if app.show_reboot_popup {
+        render_reboot_popup(app, frame);
+    }
 }
 
 fn render_list(app: &mut App, frame: &mut Frame, area: Rect, block: Block) {
@@ -560,6 +570,139 @@ fn render_input_modal(app: &mut App, frame: &mut Frame) {
             .alignment(Alignment::Center);
         frame.render_widget(instructions, layout[2]);
     }
+}
+
+fn render_quick_action_menu(app: &mut App, frame: &mut Frame) {
+    let area = centered_rect(40, 30, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Quick Actions (Esc to cancel)")
+        .style(Style::default().bg(Color::DarkGray));
+
+    let rows: Vec<Row> = app
+        .quick_actions
+        .iter()
+        .enumerate()
+        .map(|(i, action)| {
+            let style = if Some(i) == app.quick_action_list_state.selected() {
+                Style::default()
+                    .add_modifier(Modifier::REVERSED)
+                    .fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+
+            let label = match action {
+                crate::app::QuickAction::ScheduleReboot => "Schedule Reboot",
+                crate::app::QuickAction::RunComponent => "Run Component",
+                crate::app::QuickAction::RunAvScan => "Run AV Scan",
+            };
+
+            Row::new(vec![Cell::from(label)]).style(style)
+        })
+        .collect();
+
+    let table = Table::new(rows, [Constraint::Percentage(100)])
+        .block(block)
+        .highlight_symbol(">> ");
+
+    frame.render_stateful_widget(table, area, &mut app.quick_action_list_state);
+}
+
+fn render_reboot_popup(app: &mut App, frame: &mut Frame) {
+    let area = centered_rect(50, 40, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Schedule Reboot")
+        .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(block.clone(), area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(3), // Reboot Now
+            Constraint::Length(3), // Reboot Time
+            Constraint::Length(1), // Error
+            Constraint::Min(0),    // Instructions
+        ])
+        .split(block.inner(area));
+
+    // Reboot Now Checkbox
+    let now_style = if app.reboot_focus == crate::app::RebootFocus::RebootNow {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let now_text = if app.reboot_now {
+        "[x] Reboot Now"
+    } else {
+        "[ ] Reboot Now"
+    };
+    let now_p = Paragraph::new(now_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Action")
+            .style(now_style),
+    );
+    frame.render_widget(now_p, layout[0]);
+
+    // Reboot Time Input
+    let time_area = layout[1];
+    let segments_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(7), // YY
+            Constraint::Length(7), // MM
+            Constraint::Length(7), // DD
+            Constraint::Length(7), // HH
+            Constraint::Length(7), // mm
+        ])
+        .split(time_area);
+
+    let labels = ["YY", "MM", "DD", "HH", "mm"];
+    let focuses = [
+        crate::app::RebootFocus::Year,
+        crate::app::RebootFocus::Month,
+        crate::app::RebootFocus::Day,
+        crate::app::RebootFocus::Hour,
+        crate::app::RebootFocus::Minute,
+    ];
+
+    for i in 0..5 {
+        let style = if app.reboot_focus == focuses[i] {
+            Style::default().fg(Color::Yellow)
+        } else if app.reboot_now {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(labels[i])
+            .style(style);
+        let p = Paragraph::new(app.reboot_segments[i].clone())
+            .block(block)
+            .alignment(Alignment::Center);
+        frame.render_widget(p, segments_layout[i]);
+    }
+
+    // Error Message
+    if let Some(err) = &app.reboot_error {
+        let err_p = Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red));
+        frame.render_widget(err_p, layout[2]);
+    }
+
+    // Instructions
+    let instructions = Paragraph::new("Space: Toggle | Tab: Switch | Enter: Submit | Esc: Cancel")
+        .alignment(Alignment::Center)
+        .style(Style::default().add_modifier(Modifier::ITALIC));
+    frame.render_widget(instructions, layout[3]);
 }
 
 fn render_run_component_popup(app: &mut App, frame: &mut Frame) {
