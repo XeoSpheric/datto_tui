@@ -302,3 +302,66 @@ pub struct JobStdOutput {
     pub component_name: Option<String>,
     pub std_data: Option<String>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertMonitorInfo {
+    pub sends_emails: Option<bool>,
+    pub creates_ticket: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertContext {
+    #[serde(rename = "@class")]
+    pub class: Option<String>,
+    pub package_name: Option<String>,
+    pub action_type: Option<String>,
+    pub prev_version: Option<String>,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertSourceInfo {
+    pub device_uid: Option<String>,
+    pub device_name: Option<String>,
+    pub site_uid: Option<String>,
+    pub site_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertResponseAction {
+    pub action_time: Option<serde_json::Value>,
+    pub action_type: Option<String>,
+    pub description: Option<String>,
+    pub action_reference: Option<String>,
+    pub action_reference_int: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Alert {
+    pub alert_uid: Option<String>,
+    pub priority: Option<String>,
+    pub diagnostics: Option<String>,
+    pub resolved: Option<bool>,
+    pub resolved_by: Option<String>,
+    pub resolved_on: Option<serde_json::Value>,
+    pub muted: Option<bool>,
+    pub ticket_number: Option<String>,
+    pub timestamp: Option<serde_json::Value>,
+    pub alert_monitor_info: Option<AlertMonitorInfo>,
+    pub alert_context: Option<AlertContext>,
+    pub alert_source_info: Option<AlertSourceInfo>,
+    pub response_actions: Option<Vec<AlertResponseAction>>,
+    pub autoresolve_mins: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAlertsResponse {
+    pub page_details: PageDetails,
+    pub alerts: Vec<Alert>,
+}

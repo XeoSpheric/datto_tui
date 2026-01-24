@@ -1,4 +1,6 @@
-use crate::app::{App, CurrentView, InputField, InputMode, JobViewRow, SiteDetailTab};
+use crate::app::{
+    App, CurrentView, DeviceDetailTab, InputField, InputMode, JobViewRow, SiteDetailTab,
+};
 use crate::app_helpers::generate_job_rows;
 use chrono::DateTime;
 use ratatui::{
@@ -581,12 +583,32 @@ fn render_device_detail(app: &mut App, frame: &mut Frame, area: Rect) {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Percentage(30), // Security Info (Top)
-                Constraint::Percentage(70), // Activities (Bottom)
+                Constraint::Length(3),      // Tabs (Middle)
+                Constraint::Min(0),         // Content (Bottom)
             ])
             .split(chunks[1]);
 
         render_device_security(app, &device, frame, right_chunks[0]);
-        render_device_activities(app, frame, right_chunks[1]);
+
+        // Tabs
+        let tabs = Tabs::new(vec!["Open Alerts", "Activities"])
+            .select(match app.device_detail_tab {
+                DeviceDetailTab::OpenAlerts => 0,
+                DeviceDetailTab::Activities => 1,
+            })
+            .block(Block::default().borders(Borders::ALL).title("View"))
+            .highlight_style(
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            );
+        frame.render_widget(tabs, right_chunks[1]);
+
+        // Content
+        match app.device_detail_tab {
+            DeviceDetailTab::OpenAlerts => render_open_alerts(app, frame, right_chunks[2]),
+            DeviceDetailTab::Activities => render_device_activities(app, frame, right_chunks[2]),
+        }
 
         // --- Variables Popup ---
         if app.show_device_variables {
@@ -598,6 +620,88 @@ fn render_device_detail(app: &mut App, frame: &mut Frame, area: Rect) {
             area,
         );
     }
+}
+
+fn render_open_alerts(app: &mut App, frame: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title("Open Alerts");
+
+    if app.open_alerts_loading {
+        frame.render_widget(Paragraph::new("Loading alerts...").block(block), area);
+        return;
+    }
+
+    if let Some(err) = &app.open_alerts_error {
+        frame.render_widget(
+            Paragraph::new(format!("Error: {}", err))
+                .style(Style::default().fg(Color::Red))
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    if app.open_alerts.is_empty() {
+        frame.render_widget(Paragraph::new("No open alerts.").block(block), area);
+        return;
+    }
+
+    let rows: Vec<Row> = app
+        .open_alerts
+        .iter()
+        .enumerate()
+        .map(|(i, alert)| {
+            let style = if Some(i) == app.open_alerts_table_state.selected() {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+
+            let priority = alert.priority.as_deref().unwrap_or("Unknown");
+            let priority_style = match priority.to_lowercase().as_str() {
+                "critical" => Style::default().fg(Color::Red),
+                "high" => Style::default().fg(Color::Rgb(255, 165, 0)), // Orange
+                "medium" => Style::default().fg(Color::Yellow),
+                "low" => Style::default().fg(Color::Blue),
+                _ => Style::default(),
+            };
+
+            let diagnostics = alert
+                .diagnostics
+                .as_deref()
+                .unwrap_or("N/A")
+                .replace("\r\n", " ")
+                .replace('\n', " ")
+                .trim()
+                .to_string();
+
+            // Format Time
+            let time_str = format_timestamp(alert.timestamp.clone());
+
+            Row::new(vec![
+                Cell::from(Span::styled(priority, priority_style)),
+                Cell::from(diagnostics),
+                Cell::from(time_str),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(15),     // Priority
+            Constraint::Percentage(60), // Diagnostics
+            Constraint::Length(22),     // Time
+        ],
+    )
+    .header(
+        Row::new(vec!["Priority", "Diagnostics", "Time"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(block)
+    .highlight_symbol(">> ");
+
+    frame.render_stateful_widget(table, area, &mut app.open_alerts_table_state);
 }
 
 fn render_device_info(device: &crate::api::datto::types::Device, frame: &mut Frame, area: Rect) {

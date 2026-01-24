@@ -46,8 +46,8 @@ pub enum SiteDetailTab {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum DeviceDetailTab {
-    Variables,
-    Jobs,
+    OpenAlerts,
+    Activities,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -167,48 +167,47 @@ pub struct App {
 
     // Activity Logs
     pub activity_logs: Vec<ActivityLog>,
-    pub selected_activity_log: Option<ActivityLog>,
-    pub selected_job_result: Option<JobResult>,
-    pub job_result_loading: bool,
-    pub job_result_error: Option<String>,
     pub activity_logs_loading: bool,
     pub activity_logs_error: Option<String>,
     pub activity_logs_table_state: TableState,
 
-    // Activity Detail State
+    // Open Alerts
+    pub open_alerts: Vec<crate::api::datto::types::Alert>,
+    pub open_alerts_loading: bool,
+    pub open_alerts_error: Option<String>,
+    pub open_alerts_table_state: TableState,
+
+    // Job Results
+    pub selected_activity_log: Option<ActivityLog>,
+    pub selected_job_result: Option<JobResult>,
+    pub job_result_loading: bool,
+    pub job_result_error: Option<String>,
     pub selected_job_row_index: usize,
 
-    // Popup State
+    // Site & Device Editing State
+    pub variables_table_state: TableState,
+    pub udf_table_state: TableState,
+    pub editing_udf_index: Option<usize>,
+    pub site_edit_state: SiteEditState,
+    pub settings_table_state: TableState,
+    pub input_state: InputState,
+
+    pub sophos_endpoints: HashMap<String, Endpoint>,
+    pub sophos_loading: HashMap<String, bool>,
+
+    pub datto_av_agents: HashMap<String, AgentDetail>,
+    pub datto_av_loading: HashMap<String, bool>,
+    // Store alerts/policies per hostname
+    pub datto_av_alerts: HashMap<String, Vec<crate::api::datto_av::types::Alert>>,
+    pub datto_av_policies: HashMap<String, serde_json::Value>,
+
+    pub scan_status: HashMap<String, crate::event::ScanStatus>,
+
+    // Job Output Popup
     pub show_popup: bool,
     pub popup_title: String,
     pub popup_content: String,
     pub popup_loading: bool,
-
-    // Input
-    pub input_state: InputState,
-    pub variables_table_state: TableState,
-
-    // Site Edit
-    pub site_edit_state: SiteEditState,
-    pub settings_table_state: TableState,
-
-    // UDF Edit
-    pub udf_table_state: TableState,
-    pub editing_udf_index: Option<usize>, // 1-30
-
-    // Sophos Data
-    pub sophos_endpoints: HashMap<String, Endpoint>, // Key: hostname
-    pub sophos_loading: HashMap<String, bool>,
-
-    // Datto AV Data
-    // Datto AV Data
-    pub datto_av_agents: HashMap<String, AgentDetail>, // Key: hostname
-    pub datto_av_loading: HashMap<String, bool>,
-    pub datto_av_alerts: HashMap<String, Vec<crate::api::datto_av::types::Alert>>, // Key: hostname
-    pub datto_av_policies: HashMap<String, serde_json::Value>, // Key: hostname
-
-    // Scan Loading States
-    pub scan_status: HashMap<String, crate::event::ScanStatus>, // Key: hostname
 
     // Device Search Popup
     pub show_device_search: bool,
@@ -251,38 +250,51 @@ impl Default for App {
             devices_table_state: TableState::default(),
             detail_tab: SiteDetailTab::Devices,
             selected_device: None,
-            device_detail_tab: DeviceDetailTab::Variables,
+            device_detail_tab: DeviceDetailTab::OpenAlerts,
+            // Removed duplicates
+            // variables_table_state: TableState::default(),
+            // udf_table_state: TableState::default(),
+            // editing_udf_index: None,
 
             activity_logs: Vec::new(),
-            selected_activity_log: None,
-            selected_job_result: None,
-            job_result_loading: false,
-            job_result_error: None,
             activity_logs_loading: false,
             activity_logs_error: None,
             activity_logs_table_state: TableState::default(),
 
+            open_alerts: Vec::new(),
+            open_alerts_loading: false,
+            open_alerts_error: None,
+            open_alerts_table_state: TableState::default(),
+
+            selected_activity_log: None,
+            selected_job_result: None,
+            job_result_loading: false,
+            job_result_error: None,
             selected_job_row_index: 0,
+
+            variables_table_state: TableState::default(),
+            udf_table_state: TableState::default(),
+            editing_udf_index: None,
+            site_edit_state: SiteEditState::default(),
+            settings_table_state: TableState::default(),
+            input_state: InputState::default(),
+
+            sophos_endpoints: HashMap::new(),
+            sophos_loading: HashMap::new(),
+
+            datto_av_agents: HashMap::new(),
+            datto_av_loading: HashMap::new(),
+            datto_av_alerts: HashMap::new(),
+            datto_av_policies: HashMap::new(),
+
+            scan_status: HashMap::new(),
 
             show_popup: false,
             popup_title: String::new(),
             popup_content: String::new(),
             popup_loading: false,
 
-            input_state: InputState::default(),
-            variables_table_state: TableState::default(),
-            site_edit_state: SiteEditState::default(),
-            settings_table_state: TableState::default(),
-            udf_table_state: TableState::default(),
-            editing_udf_index: None,
-            sophos_endpoints: HashMap::new(),
-            sophos_loading: HashMap::new(),
-            datto_av_agents: HashMap::new(),
-            datto_av_loading: HashMap::new(),
-            datto_av_alerts: HashMap::new(),
-            datto_av_policies: HashMap::new(),
-            scan_status: HashMap::new(),
-
+            // Device Search Popup
             show_device_search: false,
             device_search_query: String::new(),
             device_search_results: Vec::new(),
@@ -879,6 +891,47 @@ impl App {
                     }
                 }
             }
+            Event::OpenAlertsFetched(device_uid, result) => {
+                // Ensure the result corresponds to the currently selected device
+                if let Some(device) = &self.selected_device {
+                    if device.uid == device_uid {
+                        self.open_alerts_loading = false;
+                        match result {
+                            Ok(alerts) => {
+                                // Debug log
+                                let _ = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("debug.log")
+                                    .map(|mut f| {
+                                        use std::io::Write;
+                                        writeln!(f, "Fetched {} alerts for device {}", alerts.len(), device_uid).unwrap();
+                                        writeln!(f, "Alerts Data: {:#?}", alerts).unwrap();
+                                    });
+
+                                self.open_alerts = alerts;
+                                if !self.open_alerts.is_empty() {
+                                    self.open_alerts_table_state.select(Some(0));
+                                } else {
+                                    self.open_alerts_table_state.select(None);
+                                }
+                            }
+                            Err(e) => {
+                                // Debug log error
+                                let _ = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("debug.log")
+                                    .map(|mut f| {
+                                        use std::io::Write;
+                                        writeln!(f, "Error fetching alerts for {}: {}", device_uid, e).unwrap();
+                                    });
+                                self.open_alerts_error = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
             Event::JobResultFetched(result) => {
                 self.job_result_loading = false;
                 match result {
@@ -1094,6 +1147,27 @@ impl App {
                     .map_err(|e| e.to_string());
 
                 tx.send(Event::ActivityLogsFetched(result)).unwrap();
+            });
+        }
+    }
+
+    pub fn fetch_open_alerts(
+        &mut self,
+        device_uid: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = self.client.clone() {
+            self.open_alerts_loading = true;
+            self.open_alerts_error = None;
+            self.open_alerts.clear();
+            
+            tokio::spawn(async move {
+                let result = client
+                    .get_device_open_alerts(&device_uid)
+                    .await
+                    .map_err(|e| e.to_string());
+                tx.send(Event::OpenAlertsFetched(device_uid, result))
+                    .unwrap();
             });
         }
     }
@@ -1624,6 +1698,9 @@ impl App {
                                 device.site_id,
                                 tx.clone(),
                             );
+                            
+                            // Fetch open alerts
+                            self.fetch_open_alerts(device.uid.clone(), tx.clone());
                         }
                     }
                 }
@@ -1720,7 +1797,13 @@ impl App {
                         self.current_view = CurrentView::Detail;
                         self.selected_device = None;
                         // Reset tab to default when leaving? Or keep state? Resetting is safer for now.
-                        self.device_detail_tab = DeviceDetailTab::Variables;
+                        self.device_detail_tab = DeviceDetailTab::OpenAlerts;
+                    }
+                    KeyCode::Tab => {
+                        self.device_detail_tab = match self.device_detail_tab {
+                            DeviceDetailTab::OpenAlerts => DeviceDetailTab::Activities,
+                            DeviceDetailTab::Activities => DeviceDetailTab::OpenAlerts,
+                        };
                     }
                     KeyCode::Char('v') => {
                         self.show_device_variables = true;
@@ -1728,39 +1811,46 @@ impl App {
                             self.udf_table_state.select(Some(0));
                         }
                     }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        self.next_activity_log();
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        self.prev_activity_log();
-                    }
-                    KeyCode::Enter | KeyCode::Char(' ') => {
-                        if let Some(idx) = self.activity_logs_table_state.selected() {
-                            if let Some(log) = self.activity_logs.get(idx) {
-                                self.selected_activity_log = Some(log.clone());
-                                self.current_view = CurrentView::ActivityDetail;
+                    KeyCode::Char('j') | KeyCode::Down => match self.device_detail_tab {
+                        DeviceDetailTab::Activities => self.next_activity_log(),
+                        DeviceDetailTab::OpenAlerts => self.next_open_alert(),
+                    },
+                    KeyCode::Char('k') | KeyCode::Up => match self.device_detail_tab {
+                        DeviceDetailTab::Activities => self.prev_activity_log(),
+                        DeviceDetailTab::OpenAlerts => self.prev_open_alert(),
+                    },
+                    KeyCode::Enter | KeyCode::Char(' ') => match self.device_detail_tab {
+                        DeviceDetailTab::Activities => {
+                            if let Some(idx) = self.activity_logs_table_state.selected() {
+                                if let Some(log) = self.activity_logs.get(idx) {
+                                    self.selected_activity_log = Some(log.clone());
+                                    self.current_view = CurrentView::ActivityDetail;
 
-                                // Parse job ID from details and fetch job result
-                                if let Some(details) = &log.details {
-                                    if let Ok(parsed) =
-                                        serde_json::from_str::<serde_json::Value>(details)
-                                    {
-                                        if let Some(job_uid) =
-                                            parsed.get("job.uid").and_then(|v| v.as_str())
+                                    // Parse job ID from details and fetch job result
+                                    if let Some(details) = &log.details {
+                                        if let Ok(parsed) =
+                                            serde_json::from_str::<serde_json::Value>(details)
                                         {
-                                            if let Some(device) = &self.selected_device {
-                                                self.fetch_job_result(
-                                                    job_uid.to_string(),
-                                                    device.uid.clone(),
-                                                    tx.clone(),
-                                                );
+                                            if let Some(job_uid) =
+                                                parsed.get("job.uid").and_then(|v| v.as_str())
+                                            {
+                                                if let Some(device) = &self.selected_device {
+                                                    self.fetch_job_result(
+                                                        job_uid.to_string(),
+                                                        device.uid.clone(),
+                                                        tx.clone(),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
+                        DeviceDetailTab::OpenAlerts => {
+                            // Currently no detailed view for open alerts, but could be added later
+                        }
+                    },
                     _ => {}
                 }
             }
@@ -2318,6 +2408,34 @@ impl App {
         }
     }
 
+    fn next_open_alert(&mut self) {
+        let i = match self.open_alerts_table_state.selected() {
+            Some(i) => {
+                if i >= self.open_alerts.len().saturating_sub(1) {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.open_alerts_table_state.select(Some(i));
+    }
+
+    fn prev_open_alert(&mut self) {
+        let i = match self.open_alerts_table_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.open_alerts.len().saturating_sub(1)
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.open_alerts_table_state.select(Some(i));
+    }
+
     fn next_activity_log(&mut self) {
         let i = match self.activity_logs_table_state.selected() {
             Some(i) => {
@@ -2418,6 +2536,17 @@ impl App {
                                 tx.clone(),
                             );
                         }
+
+                        // Always fetch activities when entering device detail
+                        self.fetch_activity_logs(
+                            device.uid.clone(),
+                            device.id,
+                            device.site_id,
+                            tx.clone(),
+                        );
+                        
+                        // Fetch open alerts
+                        self.fetch_open_alerts(device.uid.clone(), tx.clone());
                     }
                 }
             }
