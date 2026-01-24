@@ -64,9 +64,9 @@ impl DattoClient {
         Ok(())
     }
 
-    pub async fn get_device_open_alerts(&self, device_uid: &str) -> Result<Vec<types::Alert>> {
+    pub async fn get_device_open_alerts(&self, device_uid: &str, page: i32, max: i32) -> Result<types::OpenAlertsResponse> {
         // Use /api/v2/ to match other endpoints pattern
-        let url = format!("{}/api/v2/device/{}/alerts/open", self.config.api_url, device_uid);
+        let url = format!("{}/api/v2/device/{}/alerts/open?page={}&max={}", self.config.api_url, device_uid, page, max);
         
         // Log the URL
         let _ = std::fs::OpenOptions::new()
@@ -96,6 +96,6 @@ impl DattoClient {
 
         let text = resp.text().await?;
         let alerts_response: types::OpenAlertsResponse = serde_json::from_str(&text)?;
-        Ok(alerts_response.alerts)
+        Ok(alerts_response)
     }
 }

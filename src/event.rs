@@ -11,7 +11,7 @@ pub enum Event {
     Mouse(MouseEvent),
     Resize(u16, u16),
     SitesFetched(Result<SitesResponse, String>),
-    DevicesFetched(Result<DevicesResponse, String>),
+    DevicesFetched(String, Result<DevicesResponse, String>),
     IncidentsFetched(Result<Vec<crate::api::rocket_cyber::types::Incident>, String>),
     SiteVariablesFetched(
         String,
@@ -43,6 +43,7 @@ pub enum Event {
     DeviceSearchResultsFetched(Result<DevicesResponse, String>),
     ActivityLogsFetched(Result<ActivityLogsResponse, String>),
     OpenAlertsFetched(String, Result<Vec<crate::api::datto::types::Alert>, String>), // (DeviceUID, Result)
+    SiteOpenAlertsFetched(String, Result<Vec<crate::api::datto::types::Alert>, String>), // (SiteUID, Result)
     JobResultFetched(Result<JobResult, String>),
     JobStdOutFetched(Result<Vec<crate::api::datto::types::JobStdOutput>, String>),
     JobStdErrFetched(Result<Vec<crate::api::datto::types::JobStdOutput>, String>),

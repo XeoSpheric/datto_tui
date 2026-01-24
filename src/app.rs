@@ -5,8 +5,8 @@ use crate::api::datto::devices::DevicesApi;
 use crate::api::datto::jobs::JobsApi;
 use crate::api::datto::sites::SitesApi;
 use crate::api::datto::types::{
-    ActivityLog, Component, CreateVariableRequest, Device, JobResult, QuickJobComponent,
-    QuickJobRequest, QuickJobResponse, QuickJobVariable, Site, UpdateSiteRequest,
+    ActivityLog, Component, CreateVariableRequest, Device, DevicesResponse, JobResult, QuickJobComponent,
+    QuickJobRequest, QuickJobResponse, QuickJobVariable, Site, SitesResponse, UpdateSiteRequest,
     UpdateVariableRequest,
 };
 use crate::api::datto::variables::VariablesApi;
@@ -41,6 +41,7 @@ pub enum CurrentView {
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum SiteDetailTab {
     Devices,
+    Alerts,
     Variables,
     Settings,
 }
@@ -204,6 +205,12 @@ pub struct App {
     pub open_alerts_error: Option<String>,
     pub open_alerts_table_state: TableState,
 
+    // Site Open Alerts (for detail view)
+    pub site_open_alerts: Vec<crate::api::datto::types::Alert>,
+    pub site_open_alerts_loading: bool,
+    pub site_open_alerts_error: Option<String>,
+    pub site_open_alerts_table_state: TableState,
+
     // Job Results
     pub selected_activity_log: Option<ActivityLog>,
     pub selected_job_result: Option<JobResult>,
@@ -319,6 +326,11 @@ impl Default for App {
             open_alerts_loading: false,
             open_alerts_error: None,
             open_alerts_table_state: TableState::default(),
+
+            site_open_alerts: Vec::new(),
+            site_open_alerts_loading: false,
+            site_open_alerts_error: None,
+            site_open_alerts_table_state: TableState::default(),
 
             selected_activity_log: None,
             selected_job_result: None,
@@ -527,19 +539,28 @@ impl App {
                     }
                 }
             }
-            Event::DevicesFetched(result) => {
-                self.devices_loading = false;
-                match result {
-                    Ok(response) => {
-                        self.devices = response.devices;
-                        if !self.devices.is_empty() {
-                            self.devices_table_state.select(Some(0));
-                        } else {
-                            self.devices_table_state.select(None);
+            Event::DevicesFetched(site_uid, result) => {
+                // Ensure the result corresponds to the currently selected site
+                let is_current_site = if let Some(idx) = self.table_state.selected() {
+                    self.sites.get(idx).map(|s| s.uid == site_uid).unwrap_or(false)
+                } else {
+                    false
+                };
+
+                if is_current_site {
+                    self.devices_loading = false;
+                    match result {
+                        Ok(response) => {
+                            self.devices = response.devices;
+                            if !self.devices.is_empty() {
+                                self.devices_table_state.select(Some(0));
+                            } else {
+                                self.devices_table_state.select(None);
+                            }
                         }
-                    }
-                    Err(e) => {
-                        self.devices_error = Some(e.to_string());
+                        Err(e) => {
+                            self.devices_error = Some(e.to_string());
+                        }
                     }
                 }
             }
@@ -1027,6 +1048,28 @@ impl App {
                                         writeln!(f, "Error fetching alerts for {}: {}", device_uid, e).unwrap();
                                     });
                                 self.open_alerts_error = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            Event::SiteOpenAlertsFetched(site_uid, result) => {
+                if let Some(idx) = self.table_state.selected() {
+                    if let Some(site) = self.sites.get(idx) {
+                        if site.uid == site_uid {
+                            self.site_open_alerts_loading = false;
+                            match result {
+                                Ok(alerts) => {
+                                    self.site_open_alerts = alerts;
+                                    if !self.site_open_alerts.is_empty() {
+                                        self.site_open_alerts_table_state.select(Some(0));
+                                    } else {
+                                        self.site_open_alerts_table_state.select(None);
+                                    }
+                                }
+                                Err(e) => {
+                                    self.site_open_alerts_error = Some(e);
+                                }
                             }
                         }
                     }
@@ -1663,6 +1706,70 @@ impl App {
         }
     }
 
+    fn navigate_to_device_detail(
+        &mut self,
+        device: Device,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        self.selected_device = Some(device.clone());
+        self.current_view = CurrentView::DeviceDetail;
+
+        // Auto-load Security Data
+        let is_sophos = device
+            .antivirus
+            .as_ref()
+            .and_then(|av| av.antivirus_product.as_ref())
+            .map(|prod| prod.to_lowercase().contains("sophos"))
+            .unwrap_or(false);
+
+        let is_datto = device
+            .antivirus
+            .as_ref()
+            .and_then(|av| av.antivirus_product.as_ref())
+            .map(|prod| prod.to_lowercase().contains("datto"))
+            .unwrap_or(false);
+
+        if is_sophos {
+            // Find site variables for tuiMdrId
+            let sophos_params = if let Some(site) = self.sites.iter().find(|s| s.uid == device.site_uid) {
+                if let Some(vars) = &site.variables {
+                    if let Some(id_var) = vars.iter().find(|v| v.name == "tuiMdrId") {
+                        let region = vars
+                            .iter()
+                            .find(|v| v.name == "tuiMdrRegion")
+                            .map(|v| v.value.clone());
+                        Some((id_var.value.clone(), region))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some((id, region)) = sophos_params {
+                self.fetch_sophos_endpoint(id, region, device.hostname.clone(), tx.clone());
+            }
+        }
+
+        if is_datto {
+            self.fetch_datto_av_agent(device.hostname.clone(), device.udf.clone(), tx.clone());
+        }
+
+        // Always fetch activities when entering device detail
+        self.fetch_activity_logs(
+            device.uid.clone(),
+            device.id,
+            device.site_id,
+            tx.clone(),
+        );
+
+        // Fetch open alerts
+        self.fetch_open_alerts(device.uid.clone(), tx.clone());
+    }
+
     fn navigate_to_site_detail(&mut self, site_idx: usize, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
         if let Some(site) = self.sites.get(site_idx).cloned() {
             self.table_state.select(Some(site_idx));
@@ -1672,6 +1779,8 @@ impl App {
             // Refresh site data
             self.fetch_devices(site_uid.clone(), tx.clone());
             self.fetch_site_variables(site_uid.clone(), tx.clone());
+            self.fetch_site_open_alerts(site_uid.clone(), tx.clone());
+            self.site_open_alerts_table_state.select(Some(0));
             
             // Call fetch_site to get latest data (including counts)
             self.fetch_site(site_uid.clone(), tx.clone());
@@ -1709,13 +1818,32 @@ impl App {
             self.is_loading = true;
             self.error = None;
             let client = client.clone();
-            let page = self.current_page;
             tokio::spawn(async move {
-                let result = client
-                    .get_sites(page, 50, None)
-                    .await
-                    .map_err(|e| e.to_string());
-                tx.send(Event::SitesFetched(result)).unwrap();
+                let mut all_sites = Vec::new();
+                let mut current_page = 0;
+                let page_size = 250;
+
+                loop {
+                    match client.get_sites(current_page, page_size, None).await {
+                        Ok(response) => {
+                            let count = response.sites.len();
+                            all_sites.extend(response.sites);
+
+                            if count < page_size as usize || response.page_details.next_page_url.is_none() {
+                                tx.send(Event::SitesFetched(Ok(SitesResponse {
+                                    page_details: response.page_details,
+                                    sites: all_sites,
+                                }))).unwrap();
+                                break;
+                            }
+                            current_page += 1;
+                        }
+                        Err(e) => {
+                            tx.send(Event::SitesFetched(Err(e.to_string()))).unwrap();
+                            break;
+                        }
+                    }
+                }
             });
         }
     }
@@ -1737,12 +1865,32 @@ impl App {
             self.devices = Vec::new(); // Clear previous
             let client = client.clone();
             tokio::spawn(async move {
-                // Fetch first page of devices for now
-                let result = client
-                    .get_devices(&site_uid, 0, 50)
-                    .await
-                    .map_err(|e| format!("{:#}", e));
-                tx.send(Event::DevicesFetched(result)).unwrap();
+                let mut all_devices = Vec::new();
+                let mut current_page = 0;
+                let page_size = 250;
+
+                loop {
+                    match client.get_devices(&site_uid, current_page, page_size).await {
+                        Ok(response) => {
+                            let count = response.devices.len();
+                            all_devices.extend(response.devices);
+                            
+                            // If we got fewer devices than requested, or next_page_url is None, we're done
+                            if count < page_size as usize || response.page_details.next_page_url.is_none() {
+                                tx.send(Event::DevicesFetched(site_uid.clone(), Ok(DevicesResponse {
+                                    page_details: response.page_details,
+                                    devices: all_devices,
+                                }))).unwrap();
+                                break;
+                            }
+                            current_page += 1;
+                        }
+                        Err(e) => {
+                            tx.send(Event::DevicesFetched(site_uid.clone(), Err(format!("{:#}", e)))).unwrap();
+                            break;
+                        }
+                    }
+                }
             });
         }
     }
@@ -1835,12 +1983,65 @@ impl App {
             self.open_alerts.clear();
             
             tokio::spawn(async move {
-                let result = client
-                    .get_device_open_alerts(&device_uid)
-                    .await
-                    .map_err(|e| e.to_string());
-                tx.send(Event::OpenAlertsFetched(device_uid, result))
-                    .unwrap();
+                let mut all_alerts = Vec::new();
+                let mut current_page = 0;
+                let page_size = 250;
+
+                loop {
+                    match client.get_device_open_alerts(&device_uid, current_page, page_size).await {
+                        Ok(response) => {
+                            let count = response.alerts.len();
+                            all_alerts.extend(response.alerts);
+                            
+                            if count < page_size as usize || response.page_details.next_page_url.is_none() {
+                                tx.send(Event::OpenAlertsFetched(device_uid, Ok(all_alerts))).unwrap();
+                                break;
+                            }
+                            current_page += 1;
+                        }
+                        Err(e) => {
+                            tx.send(Event::OpenAlertsFetched(device_uid, Err(e.to_string()))).unwrap();
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn fetch_site_open_alerts(
+        &mut self,
+        site_uid: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = self.client.clone() {
+            self.site_open_alerts_loading = true;
+            self.site_open_alerts_error = None;
+            self.site_open_alerts.clear();
+
+            tokio::spawn(async move {
+                let mut all_alerts = Vec::new();
+                let mut current_page = 0;
+                let page_size = 250;
+
+                loop {
+                    match client.get_site_open_alerts(&site_uid, current_page, page_size).await {
+                        Ok(response) => {
+                            let count = response.alerts.len();
+                            all_alerts.extend(response.alerts);
+                            
+                            if count < page_size as usize || response.page_details.next_page_url.is_none() {
+                                tx.send(Event::SiteOpenAlertsFetched(site_uid, Ok(all_alerts))).unwrap();
+                                break;
+                            }
+                            current_page += 1;
+                        }
+                        Err(e) => {
+                            tx.send(Event::SiteOpenAlertsFetched(site_uid, Err(e.to_string()))).unwrap();
+                            break;
+                        }
+                    }
+                }
             });
         }
     }
@@ -2300,7 +2501,8 @@ impl App {
                 }
                 KeyCode::Tab => {
                     self.detail_tab = match self.detail_tab {
-                        SiteDetailTab::Devices => SiteDetailTab::Variables,
+                        SiteDetailTab::Devices => SiteDetailTab::Alerts,
+                        SiteDetailTab::Alerts => SiteDetailTab::Variables,
                         SiteDetailTab::Variables => SiteDetailTab::Settings,
                         SiteDetailTab::Settings => SiteDetailTab::Devices,
                     };
@@ -2313,90 +2515,40 @@ impl App {
                 // Determine context based on tab
                 KeyCode::Enter if self.detail_tab == SiteDetailTab::Devices => {
                     if let Some(idx) = self.devices_table_state.selected() {
-                        // Clone device to release borrow on self.devices
-                        let device_clone = self.devices.get(idx).cloned();
-
-                        if let Some(device) = device_clone {
-                            self.selected_device = Some(device.clone());
-                            self.current_view = CurrentView::DeviceDetail;
-
-                            // Auto-load Security Data
-                            let is_sophos = device
-                                .antivirus
-                                .as_ref()
-                                .and_then(|av| av.antivirus_product.as_ref())
-                                .map(|prod| prod.to_lowercase().contains("sophos"))
-                                .unwrap_or(false);
-
-                            let is_datto = device
-                                .antivirus
-                                .as_ref()
-                                .and_then(|av| av.antivirus_product.as_ref())
-                                .map(|prod| prod.to_lowercase().contains("datto"))
-                                .unwrap_or(false);
-
-                            if is_sophos {
-                                // Find site variables for tuiMdrId
-                                let sophos_params = if let Some(site) =
-                                    self.sites.iter().find(|s| s.uid == device.site_uid)
-                                {
-                                    if let Some(vars) = &site.variables {
-                                        if let Some(id_var) =
-                                            vars.iter().find(|v| v.name == "tuiMdrId")
-                                        {
-                                            let region = vars
-                                                .iter()
-                                                .find(|v| v.name == "tuiMdrRegion")
-                                                .map(|v| v.value.clone());
-                                            Some((id_var.value.clone(), region))
-                                        } else {
-                                            None
-                                        }
+                        if let Some(device) = self.devices.get(idx).cloned() {
+                            self.navigate_to_device_detail(device, tx);
+                        }
+                    }
+                }
+                KeyCode::Enter if self.detail_tab == SiteDetailTab::Alerts => {
+                    if let Some(idx) = self.site_open_alerts_table_state.selected() {
+                        if let Some(alert) = self.site_open_alerts.get(idx) {
+                            if let Some(source) = &alert.alert_source_info {
+                                if let Some(device_uid) = &source.device_uid {
+                                    // We need the full Device object to navigate. 
+                                    // Usually we have it in self.devices if the site is the same.
+                                    if let Some(device) = self.devices.iter().find(|d| d.uid == *device_uid).cloned() {
+                                        self.navigate_to_device_detail(device, tx);
                                     } else {
-                                        None
+                                        // If not found in current site devices (maybe alert is from different site? unlikely in site detail view)
+                                        // Or maybe devices haven't loaded. 
+                                        // We can try to fetch the device if we had a get_device by UID api.
+                                        // For now, assume it's in the current site.
                                     }
-                                } else {
-                                    None
-                                };
-
-                                if let Some((id, region)) = sophos_params {
-                                    self.fetch_sophos_endpoint(
-                                        id,
-                                        region,
-                                        device.hostname.clone(),
-                                        tx.clone(),
-                                    );
                                 }
                             }
-
-                            if is_datto {
-                                self.fetch_datto_av_agent(
-                                    device.hostname.clone(),
-                                    device.udf.clone(),
-                                    tx.clone(),
-                                );
-                            }
-
-                            // Always fetch activities when entering device detail
-                            self.fetch_activity_logs(
-                                device.uid.clone(),
-                                device.id,
-                                device.site_id,
-                                tx.clone(),
-                            );
-                            
-                            // Fetch open alerts
-                            self.fetch_open_alerts(device.uid.clone(), tx.clone());
                         }
                     }
                 }
                 KeyCode::Char('j') | KeyCode::Down => match self.detail_tab {
                     SiteDetailTab::Devices => self.next_device(),
+                    SiteDetailTab::Alerts => self.next_site_alert(),
                     SiteDetailTab::Variables => self.next_variable(),
                     SiteDetailTab::Settings => self.next_setting(),
                 },
                 KeyCode::Char('k') | KeyCode::Up => match self.detail_tab {
                     SiteDetailTab::Devices => self.prev_device(),
+                    SiteDetailTab::Alerts => self.prev_site_alert(),
                     SiteDetailTab::Variables => self.prev_variable(),
                     SiteDetailTab::Settings => self.prev_setting(),
                 },
@@ -2895,6 +3047,35 @@ impl App {
         };
         self.devices_table_state.select(Some(i));
     }
+
+    fn next_site_alert(&mut self) {
+        let i = match self.site_open_alerts_table_state.selected() {
+            Some(i) => {
+                if i >= self.site_open_alerts.len().saturating_sub(1) {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.site_open_alerts_table_state.select(Some(i));
+    }
+
+    fn prev_site_alert(&mut self) {
+        let i = match self.site_open_alerts_table_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.site_open_alerts.len().saturating_sub(1)
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.site_open_alerts_table_state.select(Some(i));
+    }
+
     fn next_setting(&mut self) {
         let i = match self.settings_table_state.selected() {
             Some(i) => {

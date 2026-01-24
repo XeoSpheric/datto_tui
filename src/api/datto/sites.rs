@@ -13,6 +13,7 @@ pub(crate) trait SitesApi {
     async fn update_site(&self, site_uid: &str, req: UpdateSiteRequest) -> Result<types::Site>;
 
     async fn get_site(&self, site_uid: &str) -> Result<types::Site>;
+    async fn get_site_open_alerts(&self, site_uid: &str, page: i32, max: i32) -> Result<types::OpenAlertsResponse>;
 }
 
 impl SitesApi for DattoClient {
@@ -127,5 +128,30 @@ impl SitesApi for DattoClient {
 
         let site = response.json::<types::Site>().await.context("Failed to parse site response")?;
         Ok(site)
+    }
+
+    async fn get_site_open_alerts(&self, site_uid: &str, page: i32, max: i32) -> Result<types::OpenAlertsResponse> {
+        let access_token = self.access_token.as_ref().context("Not authenticated")?;
+        let url = format!("{}/api/v2/site/{}/alerts/open?page={}&max={}", self.config.api_url, site_uid, page, max);
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context("Failed to send site alerts request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("API request failed with status: {} - {}", status, text);
+        }
+
+        let alerts_response = response
+            .json::<types::OpenAlertsResponse>()
+            .await
+            .context("Failed to parse site alerts response")?;
+        Ok(alerts_response)
     }
 }

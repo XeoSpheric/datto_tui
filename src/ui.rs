@@ -6,7 +6,10 @@ use crate::app_helpers::generate_job_rows;
 use chrono::DateTime;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap},
+    widgets::{
+        canvas::{Canvas, Line as CanvasLine},
+        Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap,
+    },
 };
 
 pub fn render(app: &mut App, frame: &mut Frame) {
@@ -23,7 +26,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 app.total_count
             )
         }
-        CurrentView::Detail => "Site Detail View | 'Esc'/'q': back, '/': search devices".to_string(),
+        CurrentView::Detail => {
+            "Site Detail View | 'Esc'/'q': back, '/': search devices".to_string()
+        }
         CurrentView::DeviceDetail => {
             "Device Detail | 'Esc'/'q': back, '/': search devices".to_string()
         }
@@ -188,15 +193,19 @@ fn render_detail(app: &mut App, frame: &mut Frame, area: Rect) {
     // --- Left Pane: Site Details ---
     if let Some(idx) = app.table_state.selected() {
         if let Some(site) = app.sites.get(idx) {
+            let chart_height = (chunks[0].width / 3) / 2;
+            let chart_height = chart_height.max(10).min(25); // Sanity bounds
+
+            let left_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(10),
+                    Constraint::Length(chart_height),
+                    Constraint::Min(0),
+                ])
+                .split(chunks[0]);
+
             let text = vec![
-                Line::from(vec![
-                    Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(&site.name),
-                ]),
-                Line::from(vec![
-                    Span::styled("UID: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(&site.uid),
-                ]),
                 Line::from(vec![
                     Span::styled(
                         "Description: ",
@@ -212,29 +221,27 @@ fn render_detail(app: &mut App, frame: &mut Frame, area: Rect) {
                             .map_or("0".to_string(), |s| s.number_of_devices.to_string()),
                     ),
                 ]),
-                Line::from(vec![
-                    Span::styled("Online: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(
-                        site.devices_status
-                            .as_ref()
-                            .map_or("0".to_string(), |s| s.number_of_online_devices.to_string()),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Offline: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(
-                        site.devices_status
-                            .as_ref()
-                            .map_or("0".to_string(), |s| s.number_of_offline_devices.to_string()),
-                    ),
-                ]),
             ];
 
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(format!("Site: {}", site.name));
             let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
-            frame.render_widget(paragraph, chunks[0]);
+            frame.render_widget(paragraph, left_chunks[0]);
+
+            // Pie Charts Area
+            let charts_layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(33),
+                    Constraint::Percentage(33),
+                    Constraint::Percentage(34),
+                ])
+                .split(left_chunks[1]);
+
+            render_alerts_pie(app, frame, charts_layout[0]);
+            render_devices_pie(app, frame, charts_layout[1]);
+            render_patch_pie(app, frame, charts_layout[2]);
         }
     }
 
@@ -244,11 +251,12 @@ fn render_detail(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(chunks[1]);
 
-    let tabs = Tabs::new(vec!["Devices", "Variables", "Settings"])
+    let tabs = Tabs::new(vec!["Devices", "Alerts", "Variables", "Settings"])
         .select(match app.detail_tab {
             SiteDetailTab::Devices => 0,
-            SiteDetailTab::Variables => 1,
-            SiteDetailTab::Settings => 2,
+            SiteDetailTab::Alerts => 1,
+            SiteDetailTab::Variables => 2,
+            SiteDetailTab::Settings => 3,
         })
         .block(Block::default().borders(Borders::ALL).title("Tabs"))
         .highlight_style(
@@ -260,6 +268,7 @@ fn render_detail(app: &mut App, frame: &mut Frame, area: Rect) {
 
     match app.detail_tab {
         SiteDetailTab::Devices => render_device_list(app, frame, right_chunks[1]),
+        SiteDetailTab::Alerts => render_site_alerts(app, frame, right_chunks[1]),
         SiteDetailTab::Variables => render_variables(app, frame, right_chunks[1]),
         SiteDetailTab::Settings => render_settings(app, frame, right_chunks[1]),
     }
@@ -402,6 +411,92 @@ fn render_device_list(app: &mut App, frame: &mut Frame, area: Rect) {
 
         frame.render_stateful_widget(table, area, &mut app.devices_table_state);
     }
+}
+
+fn render_site_alerts(app: &mut App, frame: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title("Site Alerts");
+
+    if app.site_open_alerts_loading {
+        frame.render_widget(Paragraph::new("Loading alerts...").block(block), area);
+        return;
+    }
+
+    if let Some(err) = &app.site_open_alerts_error {
+        frame.render_widget(
+            Paragraph::new(format!("Error: {}", err))
+                .style(Style::default().fg(Color::Red))
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    if app.site_open_alerts.is_empty() {
+        frame.render_widget(Paragraph::new("No open alerts.").block(block), area);
+        return;
+    }
+
+    let rows: Vec<Row> = app
+        .site_open_alerts
+        .iter()
+        .enumerate()
+        .map(|(i, alert)| {
+            let style = if Some(i) == app.site_open_alerts_table_state.selected() {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+
+            let priority = alert.priority.as_deref().unwrap_or("Unknown");
+            let priority_style = match priority.to_lowercase().as_str() {
+                "critical" => Style::default().fg(Color::Red),
+                "high" => Style::default().fg(Color::Rgb(255, 165, 0)), // Orange
+                "moderate" | "medium" => Style::default().fg(Color::Yellow),
+                "low" => Style::default().fg(Color::Cyan),
+                "information" => Style::default().fg(Color::White),
+                _ => Style::default(),
+            };
+
+            let diagnostics = alert
+                .diagnostics
+                .as_deref()
+                .unwrap_or("N/A")
+                .replace("\r\n", " ")
+                .replace('\n', " ")
+                .trim()
+                .to_string();
+
+            let computer_name = alert
+                .alert_source_info
+                .as_ref()
+                .and_then(|s| s.device_name.as_deref())
+                .unwrap_or("N/A");
+
+            Row::new(vec![
+                Cell::from(Span::styled(priority, priority_style)),
+                Cell::from(diagnostics),
+                Cell::from(computer_name.to_string()),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(12),     // Priority
+            Constraint::Percentage(60), // Diagnostics
+            Constraint::Percentage(25), // Computer Name
+        ],
+    )
+    .header(
+        Row::new(vec!["Priority", "Diagnostics", "Computer Name"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(block)
+    .highlight_symbol(">> ");
+
+    frame.render_stateful_widget(table, area, &mut app.site_open_alerts_table_state);
 }
 
 fn render_variables(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -2162,4 +2257,185 @@ fn render_device_search_popup(app: &mut App, frame: &mut Frame) {
 
         frame.render_stateful_widget(table, layout[2], &mut app.device_search_table_state);
     }
+}
+
+fn render_alerts_pie(app: &App, frame: &mut Frame, area: Rect) {
+    let mut info = 0;
+    let mut low = 0;
+    let mut moderate = 0;
+    let mut high = 0;
+    let mut critical = 0;
+
+    for alert in &app.site_open_alerts {
+        match alert
+            .priority
+            .as_deref()
+            .map(|s| s.to_lowercase())
+            .as_deref()
+        {
+            Some("information") => info += 1,
+            Some("low") => low += 1,
+            Some("moderate") | Some("medium") => moderate += 1,
+            Some("high") => high += 1,
+            Some("critical") => critical += 1,
+            _ => {}
+        }
+    }
+
+    let total = info + low + moderate + high + critical;
+    let data = vec![
+        (info as f64, Color::White, "Info"),
+        (low as f64, Color::Cyan, "Low"),
+        (moderate as f64, Color::Yellow, "Mod"),
+        (high as f64, Color::Rgb(255, 165, 0), "High"),
+        (critical as f64, Color::Red, "Crit"),
+    ];
+
+    draw_pie_chart(frame, area, "Open Alerts", total, &data);
+}
+
+fn render_devices_pie(app: &App, frame: &mut Frame, area: Rect) {
+    let mut online = 0;
+    let mut offline = 0;
+
+    if let Some(idx) = app.table_state.selected() {
+        if let Some(site) = app.sites.get(idx) {
+            if let Some(status) = &site.devices_status {
+                online = status.number_of_online_devices;
+                offline = status.number_of_offline_devices;
+            }
+        }
+    }
+
+    let total = online + offline;
+    let data = vec![
+        (online as f64, Color::Green, "Online"),
+        (offline as f64, Color::Red, "Offline"),
+    ];
+
+    draw_pie_chart(frame, area, "Device Status", total, &data);
+}
+
+fn render_patch_pie(app: &App, frame: &mut Frame, area: Rect) {
+    let mut fully_patched = 0;
+    let mut approved_pending = 0;
+    let mut install_error = 0;
+    let mut reboot_required = 0;
+    let mut no_data = 0;
+    let mut no_policy = 0;
+    let mut other = 0;
+
+    for device in &app.devices {
+        if let Some(pm) = &device.patch_management {
+            match pm.patch_status.as_deref() {
+                Some("FullyPatched") => fully_patched += 1,
+                Some("ApprovedPending") => approved_pending += 1,
+                Some("InstallError") => install_error += 1,
+                Some("RebootRequired") => reboot_required += 1,
+                Some("NoData") => no_data += 1,
+                Some("NoPolicy") => no_policy += 1,
+                _ => other += 1,
+            }
+        } else {
+            other += 1;
+        }
+    }
+
+    let total = fully_patched
+        + approved_pending
+        + install_error
+        + reboot_required
+        + no_data
+        + no_policy
+        + other;
+
+    let data = vec![
+        (fully_patched as f64, Color::Green, "Patched"),
+        (approved_pending as f64, Color::Cyan, "Pending"),
+        (install_error as f64, Color::Yellow, "Error"),
+        (reboot_required as f64, Color::Rgb(255, 165, 0), "Reboot"),
+        (no_data as f64, Color::Red, "No Data"),
+        (no_policy as f64, Color::Gray, "No Pol"),
+        (other as f64, Color::White, "Other"),
+    ];
+
+    draw_pie_chart(frame, area, "Patch Status", total, &data);
+}
+
+fn draw_pie_chart(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    total: i32,
+    data: &[(f64, Color, &str)],
+) {
+    let canvas = Canvas::default()
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .x_bounds([-100.0, 100.0])
+        .y_bounds([-100.0, 100.0])
+        .paint(move |ctx| {
+            if total == 0 {
+                ctx.print(
+                    0.0,
+                    0.0,
+                    Span::styled("No Data", Style::default().fg(Color::DarkGray)),
+                );
+                return;
+            }
+
+            let mut current_angle = 0.0;
+            // Adjust radius to maintain circular shape based on area aspect ratio
+            // Terminal characters are roughly 2x taller than wide.
+            let width = area.width as f64;
+            let height = area.height as f64;
+            let radius_x = 80.0;
+            let radius_y = radius_x * (width / (height * 2.0));
+
+            // Ensure radius_y doesn't exceed canvas bounds
+            let radius_y = radius_y.min(90.0);
+            let radius_x = if radius_y == 90.0 {
+                90.0 * (height * 2.0 / width)
+            } else {
+                radius_x
+            };
+
+            for (value, color, _label) in data {
+                if *value <= 0.0 {
+                    continue;
+                }
+
+                let sweep = (*value / total as f64) * 2.0 * std::f64::consts::PI;
+                let end_angle = current_angle + sweep;
+
+                let steps = (sweep * 100.0) as i32; // density
+                for i in 0..=steps {
+                    let angle = current_angle + (sweep * i as f64 / steps as f64);
+                    let x = radius_x * angle.cos();
+                    let y = radius_y * angle.sin();
+                    ctx.draw(&CanvasLine {
+                        x1: 0.0,
+                        y1: 0.0,
+                        x2: x,
+                        y2: y,
+                        color: *color,
+                    });
+                }
+                current_angle = end_angle;
+            }
+
+            let total_str = total.to_string();
+            ctx.print(
+                0.0,
+                0.0,
+                Span::styled(
+                    total_str,
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(Color::White)
+                        .bg(Color::Black),
+                ),
+            );
+        });
+
+    frame.render_widget(canvas, area);
 }
