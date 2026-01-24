@@ -145,6 +145,7 @@ pub enum QuickAction {
     ScheduleReboot,
     RunComponent,
     RunAvScan,
+    ReloadData,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -656,10 +657,19 @@ impl App {
                         if let Some(index) =
                             self.sites.iter().position(|s| s.uid == updated_site.uid)
                         {
-                            // Preserve variables as they are not returned in the update response (skipped)
-                            let vars = self.sites[index].variables.clone();
+                            // Preserve fields that might be missing in some API responses (like variables or status)
+                            let old_vars = self.sites[index].variables.clone();
+                            let old_status = self.sites[index].devices_status.clone();
+                            
                             self.sites[index] = updated_site;
-                            self.sites[index].variables = vars;
+                            
+                            // Only restore if the new response is missing them
+                            if self.sites[index].variables.is_none() {
+                                self.sites[index].variables = old_vars;
+                            }
+                            if self.sites[index].devices_status.is_none() {
+                                self.sites[index].devices_status = old_status;
+                            }
 
                             // If this is the currently selected site, update the edit state to reflect changes in UI
                             if let Some(selected_idx) = self.table_state.selected() {
@@ -667,6 +677,11 @@ impl App {
                                     self.populate_site_edit_state();
                                 }
                             }
+                        } else {
+                            // Site not in current list (e.g. from search), add it so it can be displayed
+                            self.sites.push(updated_site);
+                            self.table_state.select(Some(self.sites.len() - 1));
+                            self.populate_site_edit_state();
                         }
                     }
                     Err(e) => self.error = Some(e),
@@ -1378,6 +1393,12 @@ impl App {
                 if let Some(i) = self.quick_action_list_state.selected() {
                     if let Some(action) = self.quick_actions.get(i) {
                         match action {
+                            QuickAction::ReloadData => {
+                                self.show_quick_actions = false;
+                                if let Some(idx) = self.table_state.selected() {
+                                    self.navigate_to_site_detail(idx, tx);
+                                }
+                            }
                             QuickAction::ScheduleReboot => {
                                 self.show_quick_actions = false;
                                 self.show_reboot_popup = true;
@@ -1642,6 +1663,36 @@ impl App {
         }
     }
 
+    fn navigate_to_site_detail(&mut self, site_idx: usize, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(site) = self.sites.get(site_idx).cloned() {
+            self.table_state.select(Some(site_idx));
+            self.current_view = CurrentView::Detail;
+            let site_uid = site.uid.clone();
+            
+            // Refresh site data
+            self.fetch_devices(site_uid.clone(), tx.clone());
+            self.fetch_site_variables(site_uid.clone(), tx.clone());
+            
+            // Call fetch_site to get latest data (including counts)
+            self.fetch_site(site_uid.clone(), tx.clone());
+
+            // Call update_site to get latest data as requested (POST update with current data)
+            let client = self.client.as_ref().unwrap().clone();
+            let req = UpdateSiteRequest {
+                name: site.name.clone(),
+                description: site.description.clone(),
+                notes: site.notes.clone(),
+                on_demand: site.on_demand,
+                splashtop_auto_install: site.splashtop_auto_install,
+            };
+            
+            tokio::spawn(async move {
+                let result = client.update_site(&site_uid, req).await.map_err(|e| e.to_string());
+                tx.send(Event::SiteUpdated(result)).unwrap();
+            });
+        }
+    }
+
 
     fn fetch_rocket_incidents(&self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
         if let Some(client) = &self.rocket_client {
@@ -1665,6 +1716,16 @@ impl App {
                     .await
                     .map_err(|e| e.to_string());
                 tx.send(Event::SitesFetched(result)).unwrap();
+            });
+        }
+    }
+
+    fn fetch_site(&mut self, site_uid: String, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(client) = &self.client {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let result = client.get_site(&site_uid).await.map_err(|e| e.to_string());
+                tx.send(Event::SiteUpdated(result)).unwrap();
             });
         }
     }
@@ -2228,10 +2289,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(idx) = self.table_state.selected() {
-                        if let Some(site) = self.sites.get(idx) {
-                            self.current_view = CurrentView::Detail;
-                            self.fetch_devices(site.uid.clone(), tx);
-                        }
+                        self.navigate_to_site_detail(idx, tx);
                     }
                 }
                 _ => {}
@@ -2374,6 +2432,11 @@ impl App {
                     // Toggle boolean settings for quick action, or submit if purely selecting
                     self.toggle_setting(tx.clone());
                 }
+                KeyCode::Char('r') => {
+                    self.show_quick_actions = true;
+                    self.quick_actions = vec![QuickAction::ReloadData];
+                    self.quick_action_list_state.select(Some(0));
+                }
                 _ => {}
             },
             CurrentView::DeviceDetail => {
@@ -2419,11 +2482,24 @@ impl App {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
                         // Clear scan loading state for this device if needed
-                        if let Some(device) = &self.selected_device {
+                        if let Some(device) = self.selected_device.take() {
                             self.scan_status.remove(&device.hostname);
+                            
+                            // Find the site this device belongs to
+                            if let Some(site_idx) = self.sites.iter().position(|s| s.uid == device.site_uid) {
+                                self.navigate_to_site_detail(site_idx, tx);
+                            } else {
+                                // Site not in current list (common if coming from search)
+                                // Fetch it directly
+                                self.current_view = CurrentView::Detail;
+                                self.fetch_site(device.site_uid.clone(), tx.clone());
+                                self.fetch_devices(device.site_uid.clone(), tx.clone());
+                                self.fetch_site_variables(device.site_uid.clone(), tx.clone());
+                            }
+                        } else {
+                            self.current_view = CurrentView::Detail;
                         }
-                        self.current_view = CurrentView::Detail;
-                        self.selected_device = None;
+                        
                         // Reset tab to default when leaving? Or keep state? Resetting is safer for now.
                         self.device_detail_tab = DeviceDetailTab::OpenAlerts;
                     }

@@ -11,6 +11,8 @@ pub(crate) trait SitesApi {
     ) -> Result<SitesResponse>;
 
     async fn update_site(&self, site_uid: &str, req: UpdateSiteRequest) -> Result<types::Site>;
+
+    async fn get_site(&self, site_uid: &str) -> Result<types::Site>;
 }
 
 impl SitesApi for DattoClient {
@@ -102,6 +104,28 @@ impl SitesApi for DattoClient {
 
         let site =
             serde_json::from_str::<types::Site>(&text).context("Failed to parse response")?;
+        Ok(site)
+    }
+
+    async fn get_site(&self, site_uid: &str) -> Result<types::Site> {
+        let access_token = self.access_token.as_ref().context("Not authenticated")?;
+        let url = format!("{}/api/v2/site/{}", self.config.api_url, site_uid);
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context("Failed to send get site request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("API request failed with status: {} - {}", status, text);
+        }
+
+        let site = response.json::<types::Site>().await.context("Failed to parse site response")?;
         Ok(site)
     }
 }

@@ -23,7 +23,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 app.total_count
             )
         }
-        CurrentView::Detail => "Detail View | 'Esc'/'q': back, '/': search devices".to_string(),
+        CurrentView::Detail => "Site Detail View | 'Esc'/'q': back, '/': search devices".to_string(),
         CurrentView::DeviceDetail => {
             "Device Detail | 'Esc'/'q': back, '/': search devices".to_string()
         }
@@ -598,6 +598,7 @@ fn render_quick_action_menu(app: &mut App, frame: &mut Frame) {
                 crate::app::QuickAction::ScheduleReboot => "Schedule Reboot",
                 crate::app::QuickAction::RunComponent => "Run Component",
                 crate::app::QuickAction::RunAvScan => "Run AV Scan",
+                crate::app::QuickAction::ReloadData => "Reload Data",
             };
 
             Row::new(vec![Cell::from(label)]).style(style)
