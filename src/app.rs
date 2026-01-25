@@ -22,7 +22,7 @@ use crate::api::datto_av::types::AgentDetail;
 use crate::api::rocket_cyber::RocketCyberClient;
 use crate::api::rocket_cyber::incidents::IncidentsApi;
 use crate::api::sophos::{Endpoint, SophosClient};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default, Clone)]
 pub struct IncidentStats {
@@ -191,6 +191,7 @@ pub struct App {
     pub devices_table_state: TableState,
     pub detail_tab: SiteDetailTab,
     pub selected_device: Option<Device>,
+    pub selected_device_uids: HashSet<String>,
     pub device_detail_tab: DeviceDetailTab,
 
     // Activity Logs
@@ -228,6 +229,9 @@ pub struct App {
 
     pub sophos_endpoints: HashMap<String, Endpoint>,
     pub sophos_loading: HashMap<String, bool>,
+
+    pub rocket_agents: HashMap<String, crate::api::rocket_cyber::types::Agent>,
+    pub rocket_loading: HashMap<String, bool>,
 
     pub datto_av_agents: HashMap<String, AgentDetail>,
     pub datto_av_loading: HashMap<String, bool>,
@@ -311,6 +315,7 @@ impl Default for App {
             devices_table_state: TableState::default(),
             detail_tab: SiteDetailTab::Devices,
             selected_device: None,
+            selected_device_uids: HashSet::new(),
             device_detail_tab: DeviceDetailTab::OpenAlerts,
             // Removed duplicates
             // variables_table_state: TableState::default(),
@@ -347,6 +352,9 @@ impl Default for App {
 
             sophos_endpoints: HashMap::new(),
             sophos_loading: HashMap::new(),
+
+            rocket_agents: HashMap::new(),
+            rocket_loading: HashMap::new(),
 
             datto_av_agents: HashMap::new(),
             datto_av_loading: HashMap::new(),
@@ -1205,34 +1213,38 @@ impl App {
                 }
             }
             Event::QuickJobExecuted(result) => {
-                self.components_loading = false;
+                self.popup_loading = false;
                 match result {
-                    Ok(response) => {
-                        self.last_job_response = Some(response);
+                    Ok(resp) => {
+                        self.last_job_response = Some(resp);
                         self.run_component_step = RunComponentStep::Result;
                     }
                     Err(e) => {
                         self.component_error = Some(e);
-                        self.run_component_step = RunComponentStep::Result;
                     }
                 }
             }
-        }
+            Event::RocketCyberAgentFetched(hostname, result) => {
 
+                self.rocket_loading.insert(hostname.clone(), false);
+                match result {
+                    Ok(Some(agent)) => {
+                        self.rocket_agents.insert(hostname, agent);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+            }
+        }
         Ok(())
     }
 
     fn fetch_components(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
         if let Some(client) = &self.client {
             self.components_loading = true;
-            self.component_error = None;
-            self.components.clear();
-            self.filtered_components.clear();
-            
             let client = client.clone();
             tokio::spawn(async move {
-                // Fetch first page, maybe loop if needed but start with one page
-                let result = client.get_components(None).await.map_err(|e| e.to_string());
+                let result = client.get_components(Some(0)).await.map_err(|e| e.to_string());
                 tx.send(Event::ComponentsFetched(result)).unwrap();
             });
         }
@@ -1793,6 +1805,7 @@ impl App {
             self.table_state.select(Some(site_idx));
             self.current_view = CurrentView::Detail;
             let site_uid = site.uid.clone();
+            self.selected_device_uids.clear();
             
             // Refresh site data
             self.fetch_devices(site_uid.clone(), tx.clone());
@@ -2575,6 +2588,17 @@ impl App {
                         self.open_edit_variable_modal();
                     } else if self.detail_tab == SiteDetailTab::Settings {
                         self.open_edit_setting_modal();
+                    }
+                }
+                KeyCode::Char(' ') if self.detail_tab == SiteDetailTab::Devices => {
+                    if let Some(idx) = self.devices_table_state.selected() {
+                        if let Some(device) = self.devices.get(idx) {
+                            if self.selected_device_uids.contains(&device.uid) {
+                                self.selected_device_uids.remove(&device.uid);
+                            } else {
+                                self.selected_device_uids.insert(device.uid.clone());
+                            }
+                        }
                     }
                 }
                 // Variable Actions (Enter/Space on "Create +" row)

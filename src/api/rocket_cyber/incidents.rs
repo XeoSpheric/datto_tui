@@ -8,7 +8,8 @@ pub(crate) trait IncidentsApi {
 
 impl IncidentsApi for RocketCyberClient {
     async fn get_incidents(&self) -> Result<Vec<types::Incident>> {
-        let url = format!("/v3/{}/incidents?pageSize=100", self.config.api_url);
+        let base_url = self.config.api_url.trim_end_matches('/').trim_end_matches("/v3");
+        let url = format!("{}/v3/incidents?pageSize=100", base_url);
 
         let response = self
             .client

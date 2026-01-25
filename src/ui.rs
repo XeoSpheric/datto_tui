@@ -27,7 +27,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             )
         }
         CurrentView::Detail => {
-            "Site Detail View | 'Esc'/'q': back, '/': search devices".to_string()
+            "Site Detail View | 'Esc'/'q': back, '/': search, 'Space': select, 'r': quick actions"
+                .to_string()
         }
         CurrentView::DeviceDetail => {
             "Device Detail | 'Esc'/'q': back, '/': search devices".to_string()
@@ -385,8 +386,14 @@ fn render_device_list(app: &mut App, frame: &mut Frame, area: Rect) {
                     device_type = "Server".to_string();
                 }
 
+                let hostname_prefix = if app.selected_device_uids.contains(&device.uid) {
+                    "[*] "
+                } else {
+                    ""
+                };
+
                 Row::new(vec![
-                    Cell::from(device.hostname.clone()),
+                    Cell::from(format!("{}{}", hostname_prefix, device.hostname)),
                     Cell::from(device_type),
                     Cell::from(Span::styled(status, Style::default().fg(status_color))),
                     Cell::from(Span::styled(patch_status, Style::default().fg(patch_color))),
@@ -1315,11 +1322,20 @@ fn render_device_info(device: &crate::api::datto::types::Device, frame: &mut Fra
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled("■ ", Style::default().fg(patch_color)),
-            Span::raw(format!(
-                "{} | Patches Installed: {} | Patches Pending: {} | Patches Not Approved: {}",
-                patch_status_text, patches_installed, patches_pending, patches_not_approved
-            )),
+            Span::raw(format!("{}", patch_status_text)),
         ]),
+        Line::from(vec![Span::raw(format!(
+            " | Patches Installed: {}",
+            patches_installed
+        ))]),
+        Line::from(vec![Span::raw(format!(
+            " | Patches Pending: {}",
+            patches_pending
+        ))]),
+        Line::from(vec![Span::raw(format!(
+            " | Patches Not Approved: {}",
+            patches_not_approved
+        ))]),
         Line::from(vec![
             Span::styled("Site: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(device.site_name.as_deref().unwrap_or("N/A")),
@@ -1750,8 +1766,7 @@ fn render_device_security(
         {
             lines.push(Line::from("Detailed Sophos data not available."));
         }
-    } else if av_product_lower.contains("datto av") || av_product_lower.contains("datto edr")
-    {
+    } else if av_product_lower.contains("datto av") || av_product_lower.contains("datto edr") {
         if let Some(loading) = app.datto_av_loading.get(&device.hostname) {
             if *loading {
                 lines.push(Line::from(Span::styled(
@@ -1785,6 +1800,40 @@ fn render_device_security(
         {
             lines.push(Line::from("Detailed Datto AV data not available."));
         }
+    }
+
+    // Rocket Cyber Info
+    if let Some(loading) = app.rocket_loading.get(&device.hostname) {
+        if *loading {
+            lines.push(Line::from(Span::styled(
+                "Loading Rocket Cyber data...",
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    }
+
+    if let Some(agent) = app.rocket_agents.get(&device.hostname) {
+        lines.push(Line::from("")); // Spacer
+        lines.push(Line::from(Span::styled(
+            "Rocket Cyber",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+
+        let conn_color = if agent.connectivity.to_lowercase() == "online" {
+            Color::Green
+        } else {
+            Color::Red
+        };
+
+        lines.push(Line::from(vec![
+            Span::raw("Connectivity: "),
+            Span::styled(&agent.connectivity, Style::default().fg(conn_color)),
+        ]));
+
+        lines.push(Line::from(vec![
+            Span::raw("Agent Version: "),
+            Span::raw(&agent.agent_version),
+        ]));
     }
 
     let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });

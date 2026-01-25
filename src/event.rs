@@ -40,6 +40,10 @@ pub enum Event {
         Result<Vec<crate::api::datto_av::types::Alert>, String>,
     ),
     DattoAvPoliciesFetched(String, Result<serde_json::Value, String>),
+    RocketCyberAgentFetched(
+        String,
+        Result<Option<crate::api::rocket_cyber::types::Agent>, String>,
+    ),
     DeviceSearchResultsFetched(Result<DevicesResponse, String>),
     ActivityLogsFetched(Result<ActivityLogsResponse, String>),
     OpenAlertsFetched(String, Result<Vec<crate::api::datto::types::Alert>, String>), // (DeviceUID, Result)
