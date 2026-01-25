@@ -731,10 +731,14 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    self.error = Some(format!(
-                        "Failed to fetch Sophos cases for {}: {}",
-                        tenant_id, e
-                    ));
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("debug.log")
+                        .map(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, "Error fetching Sophos cases for {}: {}", tenant_id, e).unwrap();
+                        });
                 }
             },
             Event::SophosEndpointsFetched(hostname, result) => {
@@ -804,10 +808,14 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.error = Some(format!(
-                            "Failed to fetch Sophos endpoint for {}: {}",
-                            hostname, e
-                        ));
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("debug.log")
+                            .map(|mut f| {
+                                use std::io::Write;
+                                writeln!(f, "Error fetching Sophos endpoint for {}: {}", hostname, e).unwrap();
+                            });
                     }
                 }
             }
@@ -929,10 +937,14 @@ impl App {
                         self.fetch_datto_av_policies(agent.id.clone(), hostname, tx.clone());
                     }
                     Err(e) => {
-                        self.error = Some(format!(
-                            "Failed to fetch Datto AV agent for {}: {}",
-                            hostname, e
-                        ));
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("debug.log")
+                            .map(|mut f| {
+                                use std::io::Write;
+                                writeln!(f, "Error fetching Datto AV agent for {}: {}", hostname, e).unwrap();
+                            });
                     }
                 }
             }
@@ -1475,7 +1487,10 @@ impl App {
                                         .unwrap_or(false);
                                     let is_datto = device.antivirus.as_ref()
                                         .and_then(|av| av.antivirus_product.as_ref())
-                                        .map(|prod| prod.to_lowercase().contains("datto"))
+                                        .map(|prod| {
+                                            let p = prod.to_lowercase();
+                                            p.contains("datto av") || p.contains("datto edr")
+                                        })
                                         .unwrap_or(false);
 
                                     if is_sophos {
@@ -1726,7 +1741,10 @@ impl App {
             .antivirus
             .as_ref()
             .and_then(|av| av.antivirus_product.as_ref())
-            .map(|prod| prod.to_lowercase().contains("datto"))
+            .map(|prod| {
+                let p = prod.to_lowercase();
+                p.contains("datto av") || p.contains("datto edr")
+            })
             .unwrap_or(false);
 
         if is_sophos {
@@ -2679,7 +2697,10 @@ impl App {
                                 .unwrap_or(false);
                             let is_datto = device.antivirus.as_ref()
                                 .and_then(|av| av.antivirus_product.as_ref())
-                                .map(|prod| prod.to_lowercase().contains("datto"))
+                                .map(|prod| {
+                                    let p = prod.to_lowercase();
+                                    p.contains("datto av") || p.contains("datto edr")
+                                })
                                 .unwrap_or(false);
                             
                             if is_sophos || is_datto {
@@ -3383,76 +3404,8 @@ impl App {
                 // Select device
                 if let Some(idx) = self.device_search_table_state.selected() {
                     if let Some(device) = self.device_search_results.get(idx).cloned() {
-                        self.selected_device = Some(device.clone());
-                        self.current_view = CurrentView::DeviceDetail;
                         self.show_device_search = false;
-
-                        // Trigger side effects like fetching security data
-                         let is_sophos = device
-                            .antivirus
-                            .as_ref()
-                            .and_then(|av| av.antivirus_product.as_ref())
-                            .map(|prod| prod.to_lowercase().contains("sophos"))
-                            .unwrap_or(false);
-
-                        let is_datto = device
-                            .antivirus
-                            .as_ref()
-                            .and_then(|av| av.antivirus_product.as_ref())
-                            .map(|prod| prod.to_lowercase().contains("datto"))
-                            .unwrap_or(false);
-
-                        if is_sophos {
-                            let sophos_params = if let Some(site) =
-                                self.sites.iter().find(|s| s.uid == device.site_uid)
-                            {
-                                if let Some(vars) = &site.variables {
-                                    if let Some(id_var) =
-                                        vars.iter().find(|v| v.name == "tuiMdrId")
-                                    {
-                                        let region = vars
-                                            .iter()
-                                            .find(|v| v.name == "tuiMdrRegion")
-                                            .map(|v| v.value.clone());
-                                        Some((id_var.value.clone(), region))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-
-                            if let Some((id, region)) = sophos_params {
-                                self.fetch_sophos_endpoint(
-                                    id,
-                                    region,
-                                    device.hostname.clone(),
-                                    tx.clone(),
-                                );
-                            }
-                        }
-
-                        if is_datto {
-                            self.fetch_datto_av_agent(
-                                device.hostname.clone(),
-                                device.udf.clone(),
-                                tx.clone(),
-                            );
-                        }
-
-                        // Always fetch activities when entering device detail
-                        self.fetch_activity_logs(
-                            device.uid.clone(),
-                            device.id,
-                            device.site_id,
-                            tx.clone(),
-                        );
-                        
-                        // Fetch open alerts
-                        self.fetch_open_alerts(device.uid.clone(), tx.clone());
+                        self.navigate_to_device_detail(device, tx);
                     }
                 }
             }

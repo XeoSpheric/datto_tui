@@ -1639,12 +1639,14 @@ fn render_device_security(
     let mut lines = Vec::new();
 
     // Determine Security Product
-    let av_product = device
+    let av_product_raw = device
         .antivirus
         .as_ref()
         .and_then(|av| av.antivirus_product.as_ref())
-        .map(|s| s.to_lowercase())
-        .unwrap_or_default();
+        .map(|s| s.as_str())
+        .unwrap_or("Unknown");
+
+    let av_product_lower = av_product_raw.to_lowercase();
 
     // Get AV Status from Device struct (available even if detailed API call fails)
     let av_status_raw = device
@@ -1675,7 +1677,18 @@ fn render_device_security(
         _ => Color::White,
     };
 
-    if av_product.contains("sophos") {
+    // Always show basic Product and Status
+    lines.push(Line::from(vec![
+        Span::styled("Product: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(av_product_raw),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(av_status_formatted, Style::default().fg(av_status_color)),
+    ]));
+
+    if av_product_lower.contains("sophos") {
         if let Some(loading) = app.sophos_loading.get(&device.hostname) {
             if *loading {
                 lines.push(Line::from(Span::styled(
@@ -1684,17 +1697,6 @@ fn render_device_security(
                 )));
             }
         }
-
-        // Always show Product and AV Status
-        lines.push(Line::from(vec![Span::styled(
-            "Product: Sophos Endpoint",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]));
-
-        lines.push(Line::from(vec![
-            Span::raw("Status: "),
-            Span::styled(av_status_formatted, Style::default().fg(av_status_color)),
-        ]));
 
         if let Some(endpoint) = app.sophos_endpoints.get(&device.hostname) {
             let health = endpoint
@@ -1740,11 +1742,16 @@ fn render_device_security(
                     Span::styled(format!("{:?}", status), Style::default().fg(Color::Cyan)),
                 ]));
             }
-        } else if lines.len() <= 2 {
-            // Only Product and Status shown, no detailed data yet
-            lines.push(Line::from("Detailed data not available."));
+        } else if !app
+            .sophos_loading
+            .get(&device.hostname)
+            .cloned()
+            .unwrap_or(false)
+        {
+            lines.push(Line::from("Detailed Sophos data not available."));
         }
-    } else if av_product.contains("datto") {
+    } else if av_product_lower.contains("datto av") || av_product_lower.contains("datto edr")
+    {
         if let Some(loading) = app.datto_av_loading.get(&device.hostname) {
             if *loading {
                 lines.push(Line::from(Span::styled(
@@ -1753,17 +1760,6 @@ fn render_device_security(
                 )));
             }
         }
-
-        // Always show Product and AV Status
-        lines.push(Line::from(vec![Span::styled(
-            "Product: Datto AV",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]));
-
-        lines.push(Line::from(vec![
-            Span::raw("Status: "),
-            Span::styled(av_status_formatted, Style::default().fg(av_status_color)),
-        ]));
 
         if let Some(agent) = app.datto_av_agents.get(&device.hostname) {
             lines.push(Line::from(vec![
@@ -1781,11 +1777,14 @@ fn render_device_security(
                     Span::styled(format!("{:?}", status), Style::default().fg(Color::Cyan)),
                 ]));
             }
-        } else if lines.len() <= 2 {
-            lines.push(Line::from("Detailed data not available."));
+        } else if !app
+            .datto_av_loading
+            .get(&device.hostname)
+            .cloned()
+            .unwrap_or(false)
+        {
+            lines.push(Line::from("Detailed Datto AV data not available."));
         }
-    } else {
-        lines.push(Line::from("No supported security product detected."));
     }
 
     let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
