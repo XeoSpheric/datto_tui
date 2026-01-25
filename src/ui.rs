@@ -242,6 +242,8 @@ fn render_detail(app: &mut App, frame: &mut Frame, area: Rect) {
             render_alerts_pie(app, frame, charts_layout[0]);
             render_devices_pie(app, frame, charts_layout[1]);
             render_patch_pie(app, frame, charts_layout[2]);
+
+            render_av_status_bar_chart(app, frame, left_chunks[2]);
         }
     }
 
@@ -2438,4 +2440,61 @@ fn draw_pie_chart(
         });
 
     frame.render_widget(canvas, area);
+}
+
+fn render_av_status_bar_chart(app: &App, frame: &mut Frame, area: Rect) {
+    let mut stats: std::collections::BTreeMap<String, i32> = std::collections::BTreeMap::new();
+    for device in &app.devices {
+        let status = device
+            .antivirus
+            .as_ref()
+            .and_then(|av| av.antivirus_status.as_deref())
+            .unwrap_or("Unknown");
+        *stats.entry(status.to_string()).or_insert(0) += 1;
+    }
+
+    let mut lines = Vec::new();
+    let max_value = stats.values().cloned().max().unwrap_or(1);
+
+    // Reserve more space for labels and counts to prevent cutoff
+    // Label takes up to ~25 chars, count up to ~6, plus borders
+    let reserved_width = 35;
+    let bar_max_width = (area.width as i32 - reserved_width).max(1) as usize;
+
+    for (status_raw, count) in stats {
+        // Format status: RunningAndUpToDate -> Running And Up To Date
+        let mut status_formatted = String::new();
+        for (i, c) in status_raw.chars().enumerate() {
+            if i > 0 && c.is_uppercase() {
+                status_formatted.push(' ');
+            }
+            status_formatted.push(c);
+        }
+
+        let bar_width = ((count as f64 / max_value as f64) * bar_max_width as f64) as usize;
+        let bar = "█".repeat(bar_width);
+
+        let color = match status_raw.as_str() {
+            "RunningAndUpToDate" => Color::Green,
+            "RunningAndNotUpToDate" => Color::Yellow,
+            "NotDetected" => Color::Rgb(255, 165, 0), // Orange
+            "NotRunning" => Color::Red,
+            _ => Color::White,
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:>24}: ", status_formatted),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(bar, Style::default().fg(color)),
+            Span::raw(format!(" {}", count)),
+        ]));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Anti-Virus Status");
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
 }
