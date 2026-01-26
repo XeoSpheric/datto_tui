@@ -1,5 +1,5 @@
 use crate::api::datto::DattoClient;
-use crate::app_helpers::generate_job_rows;
+use crate::common::jobs::generate_job_rows;
 use crate::api::datto::activity::ActivityApi;
 use crate::api::datto::devices::DevicesApi;
 use crate::api::datto::jobs::JobsApi;
@@ -50,6 +50,7 @@ pub enum SiteDetailTab {
 pub enum DeviceDetailTab {
     OpenAlerts,
     Activities,
+    Software,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -146,7 +147,18 @@ pub enum QuickAction {
     ScheduleReboot,
     RunComponent,
     RunAvScan,
+    OpenWebRemote,
     ReloadData,
+    MoveToSite,
+    UpdateWarranty,
+    ClearWarranty,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum WarrantyFocus {
+    Year,
+    Month,
+    Day,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -205,6 +217,15 @@ pub struct App {
     pub open_alerts_loading: bool,
     pub open_alerts_error: Option<String>,
     pub open_alerts_table_state: TableState,
+
+    // Device Software
+    pub device_software: Vec<crate::api::datto::types::Software>,
+    pub filtered_software: Vec<crate::api::datto::types::Software>,
+    pub software_search_query: String,
+    pub is_software_searching: bool,
+    pub device_software_loading: bool,
+    pub device_software_error: Option<String>,
+    pub device_software_table_state: TableState,
 
     // Site Open Alerts (for detail view)
     pub site_open_alerts: Vec<crate::api::datto::types::Alert>,
@@ -286,6 +307,18 @@ pub struct App {
     pub reboot_segments: [String; 5], // YY, MM, DD, HH, mm
     pub reboot_focus: RebootFocus,
     pub reboot_error: Option<String>,
+
+    // Move Site
+    pub show_site_move: bool,
+    pub site_move_table_state: TableState,
+    pub site_move_query: String,
+    pub filtered_sites: Vec<crate::api::datto::types::Site>,
+
+    // Warranty Update
+    pub show_warranty_popup: bool,
+    pub warranty_segments: [String; 3], // YYYY, MM, DD
+    pub warranty_focus: WarrantyFocus,
+    pub warranty_error: Option<String>,
 }
 
 impl Default for App {
@@ -331,6 +364,14 @@ impl Default for App {
             open_alerts_loading: false,
             open_alerts_error: None,
             open_alerts_table_state: TableState::default(),
+
+            device_software: Vec::new(),
+            filtered_software: Vec::new(),
+            software_search_query: String::new(),
+            is_software_searching: false,
+            device_software_loading: false,
+            device_software_error: None,
+            device_software_table_state: TableState::default(),
 
             site_open_alerts: Vec::new(),
             site_open_alerts_loading: false,
@@ -411,6 +452,16 @@ impl Default for App {
             ],
             reboot_focus: RebootFocus::RebootNow,
             reboot_error: None,
+
+            show_site_move: false,
+            site_move_table_state: TableState::default(),
+            site_move_query: String::new(),
+            filtered_sites: Vec::new(),
+
+            show_warranty_popup: false,
+            warranty_segments: [String::new(), String::new(), String::new()],
+            warranty_focus: WarrantyFocus::Year,
+            warranty_error: None,
         }
     }
 }
@@ -1224,6 +1275,45 @@ impl App {
                     }
                 }
             }
+            Event::WarrantyUpdated(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(_) => {
+                        // Refresh device data
+                        if let Some(mut device) = self.selected_device.clone() {
+                            let site_uid = device.site_uid.clone();
+                            let year = &self.warranty_segments[0];
+                            let month = &self.warranty_segments[1];
+                            let day = &self.warranty_segments[2];
+                            if year.is_empty() && month.is_empty() && day.is_empty() {
+                                device.warranty_date = None;
+                            } else {
+                                device.warranty_date = Some(format!("{}-{}-{}", year, month, day));
+                            }
+                            self.selected_device = Some(device);
+                            self.fetch_devices(site_uid, tx.clone());
+                        }
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Failed to update warranty: {}", e));
+                    }
+                }
+            }
+            Event::DeviceMoved(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(_) => {
+                        // Refresh data
+                        if let Some(device) = self.selected_device.clone() {
+                            let site_uid = device.site_uid.clone();
+                            self.fetch_devices(site_uid, tx.clone());
+                        }
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Failed to move device: {}", e));
+                    }
+                }
+            }
             Event::RocketCyberAgentFetched(hostname, result) => {
 
                 self.rocket_loading.insert(hostname.clone(), false);
@@ -1235,6 +1325,24 @@ impl App {
                     Err(_) => {}
                 }
             }
+            Event::DeviceSoftwareFetched(device_uid, result) => {
+                if let Some(device) = &self.selected_device {
+                    if device.uid == device_uid {
+                        self.device_software_loading = false;
+                        match result {
+                            Ok(mut software) => {
+                                // Sort by name
+                                software.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                                self.device_software = software;
+                                self.filter_software();
+                            }
+                            Err(e) => {
+                                self.device_software_error = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1244,7 +1352,7 @@ impl App {
             self.components_loading = true;
             let client = client.clone();
             tokio::spawn(async move {
-                let result = client.get_components(Some(0)).await.map_err(|e| e.to_string());
+                let result = client.get_components(Some(0)).await.map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::ComponentsFetched(result)).unwrap();
             });
         }
@@ -1293,6 +1401,29 @@ impl App {
             self.component_list_state.select(Some(0));
         } else {
             self.component_list_state.select(None);
+        }
+    }
+
+    fn filter_software(&mut self) {
+        if self.software_search_query.is_empty() {
+            self.filtered_software = self.device_software.clone();
+        } else {
+            let query = self.software_search_query.to_lowercase();
+            self.filtered_software = self.device_software
+                .iter()
+                .filter(|s| {
+                    s.name.to_lowercase().contains(&query) || 
+                    s.version.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect();
+        }
+        
+        // Reset selection
+        if !self.filtered_software.is_empty() {
+            self.device_software_table_state.select(Some(0));
+        } else {
+            self.device_software_table_state.select(None);
         }
     }
 
@@ -1552,6 +1683,29 @@ impl App {
                                     }
                                 }
                             }
+                            QuickAction::ClearWarranty => {
+                                self.show_quick_actions = false;
+                                self.warranty_segments = [String::new(), String::new(), String::new()];
+                                self.submit_warranty_update(tx);
+                            }
+                            QuickAction::UpdateWarranty => {
+                                self.show_quick_actions = false;
+                                self.open_warranty_popup();
+                            }
+                            QuickAction::MoveToSite => {
+                                self.show_quick_actions = false;
+                                self.show_site_move = true;
+                                self.site_move_query.clear();
+                                self.filter_sites_for_move();
+                            }
+                            QuickAction::OpenWebRemote => {
+                                self.show_quick_actions = false;
+                                if let Some(device) = &self.selected_device {
+                                    if let Some(url) = &device.web_remote_url {
+                                        crate::common::utils::open_browser(url);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1622,6 +1776,9 @@ impl App {
             }
             KeyCode::Char(' ') if self.reboot_focus == RebootFocus::RebootNow => {
                 self.reboot_now = !self.reboot_now;
+            }
+            KeyCode::Char('x') => {
+                self.warranty_segments = [String::new(), String::new(), String::new()];
             }
             KeyCode::Char(c) if c.is_digit(10) => {
                 if self.reboot_now && self.reboot_focus != RebootFocus::RebootNow {
@@ -1741,6 +1898,12 @@ impl App {
         self.selected_device = Some(device.clone());
         self.current_view = CurrentView::DeviceDetail;
 
+        // Reset software search
+        self.software_search_query.clear();
+        self.is_software_searching = false;
+        self.device_software.clear();
+        self.filtered_software.clear();
+
         // Auto-load Security Data
         let is_sophos = device
             .antivirus
@@ -1798,6 +1961,64 @@ impl App {
 
         // Fetch open alerts
         self.fetch_open_alerts(device.uid.clone(), tx.clone());
+
+        // Fetch software if supported
+        let is_software_supported = device.device_class.as_ref().map(|s| s.trim().to_lowercase()).as_deref() == Some("device");
+        
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("debug.log")
+            .map(|mut f| {
+                use std::io::Write;
+                writeln!(f, "Device UID: {}, Class: {:?}, Software Supported: {}", device.uid, device.device_class, is_software_supported).unwrap();
+            });
+
+        if is_software_supported {
+            self.fetch_device_software(device.uid.clone(), tx.clone());
+        }
+    }
+
+    pub fn fetch_device_software(
+        &mut self,
+        device_uid: String,
+        tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        if let Some(client) = self.client.clone() {
+            self.device_software_loading = true;
+            self.device_software_error = None;
+            self.device_software.clear();
+
+            tokio::spawn(async move {
+                let mut all_software = Vec::new();
+                let mut current_page = 0;
+                let page_size = 250;
+
+                loop {
+                    match client
+                        .get_device_software(&device_uid, current_page, page_size)
+                        .await
+                    {
+                        Ok(response) => {
+                            let count = response.software.len();
+                            all_software.extend(response.software);
+
+                            if count < page_size as usize || response.page_details.next_page_url.is_none() {
+                                tx.send(Event::DeviceSoftwareFetched(device_uid, Ok(all_software)))
+                                    .unwrap();
+                                break;
+                            }
+                            current_page += 1;
+                        }
+                        Err(e) => {
+                            tx.send(Event::DeviceSoftwareFetched(device_uid, Err(e.to_string())))
+                                .unwrap();
+                            break;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     fn navigate_to_site_detail(&mut self, site_idx: usize, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
@@ -1827,7 +2048,7 @@ impl App {
             };
             
             tokio::spawn(async move {
-                let result = client.update_site(&site_uid, req).await.map_err(|e| e.to_string());
+                let result = client.update_site(&site_uid, req).await.map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::SiteUpdated(result)).unwrap();
             });
         }
@@ -1838,7 +2059,7 @@ impl App {
         if let Some(client) = &self.rocket_client {
             let client = client.clone();
             tokio::spawn(async move {
-                let result = client.get_incidents().await.map_err(|e| e.to_string());
+                let result = client.get_incidents().await.map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::IncidentsFetched(result)).unwrap();
             });
         }
@@ -1883,7 +2104,7 @@ impl App {
         if let Some(client) = &self.client {
             let client = client.clone();
             tokio::spawn(async move {
-                let result = client.get_site(&site_uid).await.map_err(|e| e.to_string());
+                let result = client.get_site(&site_uid).await.map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::SiteUpdated(result)).unwrap();
             });
         }
@@ -1947,7 +2168,7 @@ impl App {
                 let result = client
                     .search_devices(&query)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::DeviceSearchResultsFetched(result)).unwrap();
             });
         }
@@ -1996,7 +2217,7 @@ impl App {
                         });
                         response
                     })
-                    .map_err(|e| e.to_string());
+                    .map_err(|e: anyhow::Error| e.to_string());
 
                 tx.send(Event::ActivityLogsFetched(result)).unwrap();
             });
@@ -2094,7 +2315,7 @@ impl App {
                 let result = client
                     .get_job_result(&job_uid, &device_uid)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::JobResultFetched(result)).unwrap();
             });
         }
@@ -2117,7 +2338,7 @@ impl App {
                 let result = client
                     .get_job_stdout(&job_uid, &device_uid)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::JobStdOutFetched(result)).unwrap();
             });
         }
@@ -2140,7 +2361,7 @@ impl App {
                 let result = client
                     .get_job_stderr(&job_uid, &device_uid)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::JobStdErrFetched(result)).unwrap();
             });
         }
@@ -2157,7 +2378,7 @@ impl App {
                 let result = client
                     .get_site_variables(&site_uid)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::SiteVariablesFetched(site_uid, result))
                     .unwrap();
             });
@@ -2277,7 +2498,7 @@ impl App {
                         .ok_or_else(|| anyhow::anyhow!("No agent found"))
                 }
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e: anyhow::Error| e.to_string());
 
                 tx.send(Event::DattoAvAgentFetched(h_name, result)).unwrap();
             });
@@ -2296,7 +2517,7 @@ impl App {
                 let result = client
                     .get_agent_alerts(&agent_id)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::DattoAvAlertsFetched(hostname, result))
                     .unwrap();
             });
@@ -2315,7 +2536,7 @@ impl App {
                 let result = client
                     .get_agent_policies(&agent_id)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::DattoAvPoliciesFetched(hostname, result))
                     .unwrap();
             });
@@ -2337,7 +2558,7 @@ impl App {
                 let result = client
                     .scan_agent(&agent_id)
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::DattoAvScanStarted(hostname, result))
                     .unwrap();
             });
@@ -2378,7 +2599,7 @@ impl App {
                                     client.start_scan(&t_id, &region, &endpoint_id).await
                                 }
                                 .await
-                                .map_err(|e| e.to_string());
+                                .map_err(|e: anyhow::Error| e.to_string());
 
                                 tx.send(Event::SophosScanStarted(hostname, result)).unwrap();
                             });
@@ -2406,6 +2627,16 @@ impl App {
 
         if self.show_quick_actions {
             self.handle_quick_action_input(key, tx);
+            return;
+        }
+
+        if self.show_warranty_popup {
+            self.handle_warranty_input(key, tx);
+            return;
+        }
+
+        if self.show_site_move {
+            self.handle_site_move_input(key, tx);
             return;
         }
 
@@ -2497,15 +2728,18 @@ impl App {
 
         match key.code {
             KeyCode::Char('/') => {
-                self.show_device_search = true;
-                // Don't clear query if we want to remember last search?
-                // User said "first, I want a popup search...".
-                // Usually search clears or selects all. Let's clear for now.
-                self.device_search_query.clear();
-                self.device_search_results.clear();
-                self.last_search_input = None;
-                self.last_searched_query.clear();
-                self.device_search_error = None;
+                if self.current_view == CurrentView::DeviceDetail && self.device_detail_tab == DeviceDetailTab::Software {
+                    self.is_software_searching = true;
+                    self.software_search_query.clear();
+                    self.filter_software();
+                } else {
+                    self.show_device_search = true;
+                    self.device_search_query.clear();
+                    self.device_search_results.clear();
+                    self.last_search_input = None;
+                    self.last_searched_query.clear();
+                    self.device_search_error = None;
+                }
                 return;
             }
             _ => {}
@@ -2634,6 +2868,29 @@ impl App {
                 _ => {}
             },
             CurrentView::DeviceDetail => {
+                if self.is_software_searching && self.device_detail_tab == DeviceDetailTab::Software {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.is_software_searching = false;
+                            self.software_search_query.clear();
+                            self.filter_software();
+                        }
+                        KeyCode::Enter => {
+                            self.is_software_searching = false;
+                        }
+                        KeyCode::Char(c) => {
+                            self.software_search_query.push(c);
+                            self.filter_software();
+                        }
+                        KeyCode::Backspace => {
+                            self.software_search_query.pop();
+                            self.filter_software();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
                 if self.show_device_variables {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('q') => {
@@ -2697,10 +2954,43 @@ impl App {
                         // Reset tab to default when leaving? Or keep state? Resetting is safer for now.
                         self.device_detail_tab = DeviceDetailTab::OpenAlerts;
                     }
-                    KeyCode::Tab => {
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        let is_software_supported = if let Some(device) = &self.selected_device {
+                            device.device_class.as_ref().map(|s| s.trim().to_lowercase()).as_deref() == Some("device")
+                        } else {
+                            false
+                        };
+
+                        let is_backtab = matches!(key.code, KeyCode::BackTab);
+
                         self.device_detail_tab = match self.device_detail_tab {
-                            DeviceDetailTab::OpenAlerts => DeviceDetailTab::Activities,
-                            DeviceDetailTab::Activities => DeviceDetailTab::OpenAlerts,
+                            DeviceDetailTab::OpenAlerts => {
+                                if is_backtab {
+                                    if is_software_supported {
+                                        DeviceDetailTab::Software
+                                    } else {
+                                        DeviceDetailTab::Activities
+                                    }
+                                } else {
+                                    DeviceDetailTab::Activities
+                                }
+                            }
+                            DeviceDetailTab::Activities => {
+                                if is_backtab {
+                                    DeviceDetailTab::OpenAlerts
+                                } else if is_software_supported {
+                                    DeviceDetailTab::Software
+                                } else {
+                                    DeviceDetailTab::OpenAlerts
+                                }
+                            }
+                            DeviceDetailTab::Software => {
+                                if is_backtab {
+                                    DeviceDetailTab::Activities
+                                } else {
+                                    DeviceDetailTab::OpenAlerts
+                                }
+                            }
                         };
                     }
                     KeyCode::Char('v') => {
@@ -2711,7 +3001,12 @@ impl App {
                     }
                     KeyCode::Char('r') => {
                         self.show_quick_actions = true;
-                        self.quick_actions = vec![QuickAction::ScheduleReboot, QuickAction::RunComponent];
+                        self.quick_actions = vec![
+                            QuickAction::ScheduleReboot,
+                            QuickAction::RunComponent,
+                            QuickAction::MoveToSite,
+                            QuickAction::UpdateWarranty,
+                        ];
                         
                         // Check if AV is Sophos or Datto for AV Scan action
                         if let Some(device) = &self.selected_device {
@@ -2730,16 +3025,22 @@ impl App {
                             if is_sophos || is_datto {
                                 self.quick_actions.push(QuickAction::RunAvScan);
                             }
+
+                            if device.web_remote_url.is_some() {
+                                self.quick_actions.push(QuickAction::OpenWebRemote);
+                            }
                         }
                         self.quick_action_list_state.select(Some(0));
                     }
                     KeyCode::Char('j') | KeyCode::Down => match self.device_detail_tab {
                         DeviceDetailTab::Activities => self.next_activity_log(),
                         DeviceDetailTab::OpenAlerts => self.next_open_alert(),
+                        DeviceDetailTab::Software => self.next_software(),
                     },
                     KeyCode::Char('k') | KeyCode::Up => match self.device_detail_tab {
                         DeviceDetailTab::Activities => self.prev_activity_log(),
                         DeviceDetailTab::OpenAlerts => self.prev_open_alert(),
+                        DeviceDetailTab::Software => self.prev_software(),
                     },
                     KeyCode::Enter | KeyCode::Char(' ') => match self.device_detail_tab {
                         DeviceDetailTab::Activities => {
@@ -2771,6 +3072,9 @@ impl App {
                         }
                         DeviceDetailTab::OpenAlerts => {
                             // Currently no detailed view for open alerts, but could be added later
+                        }
+                        DeviceDetailTab::Software => {
+                            // Currently no detailed view for software, but could be added later
                         }
                     },
                     _ => {}
@@ -2912,7 +3216,7 @@ impl App {
                         let result = client
                             .create_site_variable(&site_uid, req)
                             .await
-                            .map_err(|e| e.to_string());
+                            .map_err(|e: anyhow::Error| e.to_string());
                         tx.send(Event::VariableCreated(site_uid, result)).unwrap();
                     });
                 } else if let Some(id) = self.input_state.editing_variable_id {
@@ -2922,7 +3226,7 @@ impl App {
                         let result = client
                             .update_site_variable(&site_uid, id, req)
                             .await
-                            .map_err(|e| e.to_string());
+                            .map_err(|e: anyhow::Error| e.to_string());
                         tx.send(Event::VariableUpdated(site_uid, result)).unwrap();
                     });
                 }
@@ -2989,7 +3293,7 @@ impl App {
                     let result = client
                         .update_site(&site_uid, req)
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e: anyhow::Error| e.to_string());
                     tx.send(Event::SiteUpdated(result)).unwrap();
                 });
             }
@@ -3413,6 +3717,248 @@ impl App {
             None => 0,
         };
         self.activity_logs_table_state.select(Some(i));
+    }
+
+    fn next_software(&mut self) {
+        let i = match self.device_software_table_state.selected() {
+            Some(i) => {
+                if i >= self.filtered_software.len().saturating_sub(1) {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.device_software_table_state.select(Some(i));
+    }
+
+    fn prev_software(&mut self) {
+        let i = match self.device_software_table_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.filtered_software.len().saturating_sub(1)
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.device_software_table_state.select(Some(i));
+    }
+
+    fn filter_sites_for_move(&mut self) {
+        if self.site_move_query.is_empty() {
+            self.filtered_sites = self.sites.clone();
+        } else {
+            let query = self.site_move_query.to_lowercase();
+            self.filtered_sites = self.sites
+                .iter()
+                .filter(|s| s.name.to_lowercase().contains(&query))
+                .cloned()
+                .collect();
+        }
+        
+        if !self.filtered_sites.is_empty() {
+            self.site_move_table_state.select(Some(0));
+        } else {
+            self.site_move_table_state.select(None);
+        }
+    }
+
+    fn move_selected_device(&mut self, site_uid: String, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(client) = &self.client {
+            if let Some(device) = &self.selected_device {
+                self.is_loading = true;
+                let client = client.clone();
+                let device_uid = device.uid.clone();
+                tokio::spawn(async move {
+                    let result = client.move_device(&device_uid, &site_uid).await.map_err(|e: anyhow::Error| e.to_string());
+                    tx.send(Event::DeviceMoved(result)).unwrap();
+                });
+            }
+        }
+    }
+
+    fn open_warranty_popup(&mut self) {
+        self.show_warranty_popup = true;
+        self.warranty_error = None;
+        self.warranty_focus = WarrantyFocus::Year;
+        
+        if let Some(device) = &self.selected_device {
+            if let Some(date) = &device.warranty_date {
+                // Parse yyyy-mm-dd
+                let parts: Vec<&str> = date.split('-').collect();
+                if parts.len() == 3 {
+                    self.warranty_segments[0] = parts[0].to_string();
+                    self.warranty_segments[1] = parts[1].to_string();
+                    self.warranty_segments[2] = parts[2].to_string();
+                    return;
+                }
+            }
+        }
+        
+        // Default to empty or current year? Let's use empty
+        self.warranty_segments = [String::new(), String::new(), String::new()];
+    }
+
+    fn adjust_warranty_segment(&mut self, delta: i32) {
+        let idx = match self.warranty_focus {
+            WarrantyFocus::Year => 0,
+            WarrantyFocus::Month => 1,
+            WarrantyFocus::Day => 2,
+        };
+        
+        let mut val: i32 = self.warranty_segments[idx].parse().unwrap_or(0);
+        val += delta;
+        
+        match self.warranty_focus {
+            WarrantyFocus::Year => { if val < 0 { val = 9999; } if val > 9999 { val = 0; } },
+            WarrantyFocus::Month => { if val < 1 { val = 12; } if val > 12 { val = 1; } },
+            WarrantyFocus::Day => { if val < 1 { val = 31; } if val > 31 { val = 1; } },
+        }
+        
+        if self.warranty_focus == WarrantyFocus::Year {
+            self.warranty_segments[idx] = format!("{:04}", val);
+        } else {
+            self.warranty_segments[idx] = format!("{:02}", val);
+        }
+    }
+
+    fn handle_warranty_input(&mut self, key: KeyEvent, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        match key.code {
+            KeyCode::Esc => {
+                self.show_warranty_popup = false;
+            }
+            KeyCode::Tab | KeyCode::Right => {
+                self.warranty_focus = match self.warranty_focus {
+                    WarrantyFocus::Year => WarrantyFocus::Month,
+                    WarrantyFocus::Month => WarrantyFocus::Day,
+                    WarrantyFocus::Day => WarrantyFocus::Year,
+                };
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                self.warranty_focus = match self.warranty_focus {
+                    WarrantyFocus::Year => WarrantyFocus::Day,
+                    WarrantyFocus::Month => WarrantyFocus::Year,
+                    WarrantyFocus::Day => WarrantyFocus::Month,
+                };
+            }
+            KeyCode::Up => {
+                self.adjust_warranty_segment(1);
+            }
+            KeyCode::Down => {
+                self.adjust_warranty_segment(-1);
+            }
+            KeyCode::Enter => {
+                self.submit_warranty_update(tx);
+            }
+            KeyCode::Backspace => {
+                let idx = match self.warranty_focus {
+                    WarrantyFocus::Year => 0,
+                    WarrantyFocus::Month => 1,
+                    WarrantyFocus::Day => 2,
+                };
+                self.warranty_segments[idx].pop();
+            }
+            KeyCode::Char('x') => {
+                self.warranty_segments = [String::new(), String::new(), String::new()];
+            }
+            KeyCode::Char(c) if c.is_digit(10) => {
+                let idx = match self.warranty_focus {
+                    WarrantyFocus::Year => 0,
+                    WarrantyFocus::Month => 1,
+                    WarrantyFocus::Day => 2,
+                };
+                
+                let limit = if self.warranty_focus == WarrantyFocus::Year { 4 } else { 2 };
+                let mut s = self.warranty_segments[idx].clone();
+                s.push(c);
+                if s.len() > limit {
+                    s.remove(0);
+                }
+                self.warranty_segments[idx] = s;
+                
+                // Auto-advance
+                if self.warranty_segments[idx].len() == limit {
+                    if self.warranty_focus == WarrantyFocus::Year {
+                        self.warranty_focus = WarrantyFocus::Month;
+                    } else if self.warranty_focus == WarrantyFocus::Month {
+                        self.warranty_focus = WarrantyFocus::Day;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_warranty_update(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        let year = &self.warranty_segments[0];
+        let month = &self.warranty_segments[1];
+        let day = &self.warranty_segments[2];
+
+        let date_str = if year.is_empty() && month.is_empty() && day.is_empty() {
+            None
+        } else {
+            // Basic validation
+            if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+                self.warranty_error = Some("Invalid date format. Use YYYY-MM-DD".to_string());
+                return;
+            }
+            Some(format!("{}-{}-{}", year, month, day))
+        };
+
+        if let Some(client) = &self.client {
+            if let Some(device) = &self.selected_device {
+                self.is_loading = true;
+                let client = client.clone();
+                let device_uid = device.uid.clone();
+                self.show_warranty_popup = false;
+                tokio::spawn(async move {
+                    let result = client.update_device_warranty(&device_uid, date_str).await.map_err(|e: anyhow::Error| e.to_string());
+                    tx.send(Event::WarrantyUpdated(result)).unwrap();
+                });
+            }
+        }
+    }
+
+    fn handle_site_move_input(&mut self, key: KeyEvent, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        match key.code {
+            KeyCode::Esc => {
+                self.show_site_move = false;
+                self.show_quick_actions = true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(i) = self.site_move_table_state.selected() {
+                    let next = if i >= self.filtered_sites.len().saturating_sub(1) { 0 } else { i + 1 };
+                    self.site_move_table_state.select(Some(next));
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(i) = self.site_move_table_state.selected() {
+                    let next = if i == 0 { self.filtered_sites.len().saturating_sub(1) } else { i - 1 };
+                    self.site_move_table_state.select(Some(next));
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(i) = self.site_move_table_state.selected() {
+                    if let Some(site) = self.filtered_sites.get(i) {
+                        let site_uid = site.uid.clone();
+                        self.show_site_move = false;
+                        self.move_selected_device(site_uid, tx);
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                self.site_move_query.push(c);
+                self.filter_sites_for_move();
+            }
+            KeyCode::Backspace => {
+                self.site_move_query.pop();
+                self.filter_sites_for_move();
+            }
+            _ => {}
+        }
     }
 
     fn handle_device_search_input(

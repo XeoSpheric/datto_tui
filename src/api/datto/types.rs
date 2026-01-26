@@ -454,3 +454,17 @@ pub struct QuickJobResponse {
     pub job_components: Option<Vec<QuickJobResponseComponent>>,
     pub job: Option<QuickJobInfo>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Software {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SoftwareResponse {
+    pub page_details: PageDetails,
+    pub software: Vec<Software>,
+}

@@ -53,6 +53,9 @@ pub enum Event {
     JobStdErrFetched(Result<Vec<crate::api::datto::types::JobStdOutput>, String>),
     ComponentsFetched(Result<crate::api::datto::types::ComponentsResponse, String>),
     QuickJobExecuted(Result<crate::api::datto::types::QuickJobResponse, String>),
+    DeviceMoved(Result<(), String>),
+    WarrantyUpdated(Result<(), String>),
+    DeviceSoftwareFetched(String, Result<Vec<crate::api::datto::types::Software>, String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

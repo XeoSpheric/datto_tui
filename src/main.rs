@@ -1,8 +1,9 @@
 pub mod api;
 pub mod app;
-pub mod app_helpers;
+pub mod common;
 pub mod config;
 pub mod event;
+pub mod pages;
 pub mod tui;
 pub mod ui;
 
@@ -38,7 +39,6 @@ async fn main() -> Result<()> {
     let mut terminal = tui::init()?;
     tui::install_panic_hook();
 
-    // Create app and event handler including tick rate
     // Create app and event handler including tick rate
     let mut app = App::new(Some(client), rocket_client, sophos_client, datto_av_client);
 
