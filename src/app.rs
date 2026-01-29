@@ -21,6 +21,7 @@ use crate::api::datto_av::DattoAvClient;
 use crate::api::datto_av::types::AgentDetail;
 use crate::api::rocket_cyber::RocketCyberClient;
 use crate::api::rocket_cyber::incidents::IncidentsApi;
+use crate::api::rocket_cyber::agents::AgentsApi;
 use crate::api::sophos::{Endpoint, SophosClient};
 use std::collections::{HashMap, HashSet};
 
@@ -1951,6 +1952,11 @@ impl App {
             self.fetch_datto_av_agent(device.hostname.clone(), device.udf.clone(), tx.clone());
         }
 
+        // Fetch Rocket Cyber agent
+        if self.rocket_client.is_some() {
+            self.fetch_rocket_cyber_agent(device.hostname.clone(), tx.clone());
+        }
+
         // Always fetch activities when entering device detail
         self.fetch_activity_logs(
             device.uid.clone(),
@@ -2061,6 +2067,25 @@ impl App {
             tokio::spawn(async move {
                 let result = client.get_incidents().await.map_err(|e: anyhow::Error| e.to_string());
                 tx.send(Event::IncidentsFetched(result)).unwrap();
+            });
+        }
+    }
+
+    fn fetch_rocket_cyber_agent(&mut self, hostname: String, tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(client) = &self.rocket_client {
+            self.rocket_loading.insert(hostname.clone(), true);
+            let client = client.clone();
+            tokio::spawn(async move {
+                let result = client.get_agents(&hostname).await;
+                match result {
+                    Ok(agents) => {
+                        let agent = agents.into_iter().next();
+                        tx.send(Event::RocketCyberAgentFetched(hostname, Ok(agent))).unwrap();
+                    }
+                    Err(e) => {
+                        tx.send(Event::RocketCyberAgentFetched(hostname, Err(e.to_string()))).unwrap();
+                    }
+                }
             });
         }
     }

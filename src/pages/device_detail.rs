@@ -702,6 +702,13 @@ fn render_device_security(
             Span::raw("Agent Version: "),
             Span::raw(&agent.agent_version),
         ]));
+
+        lines.push(Line::from(vec![
+            Span::raw("Last Connected: "),
+            Span::raw(format_timestamp(Some(serde_json::Value::String(
+                agent.last_connected_at.clone(),
+            )))),
+        ]));
     }
 
     let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
